@@ -16,6 +16,7 @@ from tqdm import tqdm
 from eb_jepa.architectures import (
     ImpalaEncoder,
     InverseDynamicsModel,
+    MultiHorizonRNNPredictor,
     Projector,
     RNNPredictor,
 )
@@ -211,9 +212,17 @@ def run(
     )
     test_output = encoder(test_input)
     _, f, _, h, w = test_output.shape
-    predictor = RNNPredictor(
-        hidden_size=encoder.mlp_output_dim, final_ln=encoder.final_ln
-    )
+    num_horizons = cfg.model.get("num_horizons", 1)
+    if num_horizons > 1:
+        predictor = MultiHorizonRNNPredictor(
+            hidden_size=encoder.mlp_output_dim,
+            num_horizons=num_horizons,
+            final_ln=encoder.final_ln,
+        )
+    else:
+        predictor = RNNPredictor(
+            hidden_size=encoder.mlp_output_dim, final_ln=encoder.final_ln
+        )
     aencoder = nn.Identity()
     if cfg.model.regularizer.use_proj:
         projector = Projector(
@@ -262,8 +271,17 @@ def run(
         hcost=nn.MSELoss(),
     )
 
+    # Optional: freeze the encoder. The 4 MTP predictors (and the IDM in the
+    # regularizer) keep training on the fixed latent space. Only params with
+    # requires_grad=True are passed to AdamW so the encoder stays put.
+    if cfg.model.get("freeze_encoder", False):
+        for p in encoder.parameters():
+            p.requires_grad_(False)
+        encoder.eval()
+        logger.info("🥶 Encoder frozen — training predictor / IDM / probe only")
+
     jepa_optimizer = AdamW(
-        jepa.parameters(),
+        filter(lambda p: p.requires_grad, jepa.parameters()),
         lr=cfg.optim.lr,
         weight_decay=cfg.optim.get("weight_decay", 1e-6),
     )
@@ -398,15 +416,22 @@ def run(
                 # Calculate JEPA loss
                 jepa_optimizer.zero_grad()
                 with autocast(device.type, enabled=use_amp, dtype=dtype):
-                    _, (jepa_loss, regl, regl_unweight, regldict, pl) = jepa.unroll(
-                        x,
-                        a,
-                        nsteps=cfg.model.nsteps,
-                        unroll_mode="autoregressive",
-                        ctxt_window_time=1,
-                        compute_loss=True,
-                        return_all_steps=False,
-                    )
+                    if num_horizons > 1:
+                        _, (jepa_loss, regl, regl_unweight, regldict, pl) = (
+                            jepa.unroll_multihorizon(x, a)
+                        )
+                    else:
+                        _, (jepa_loss, regl, regl_unweight, regldict, pl) = (
+                            jepa.unroll(
+                                x,
+                                a,
+                                nsteps=cfg.model.nsteps,
+                                unroll_mode="autoregressive",
+                                ctxt_window_time=1,
+                                compute_loss=True,
+                                return_all_steps=False,
+                            )
+                        )
                     total_loss += jepa_loss
 
                 # Auxiliary position loss: shape the ENCODER so its latent is

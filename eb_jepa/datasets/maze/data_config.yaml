@@ -17,8 +17,8 @@ max_gen_retries: 64 # how many times to retry maze generation per __getitem__
 agent_std: 1.2      # Gaussian dot std (pixels). Cell size is 3 px, so ~1 cell wide.
 
 # Dataset size
-size: 100000
-val_size: 10000
+size: 10000
+val_size: 1000
 batch_size: 64
 train: true
 normalize: true

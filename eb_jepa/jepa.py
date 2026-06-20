@@ -204,6 +204,44 @@ class JEPA(JEPAbase):
         else:
             return predicted_states, losses
 
+    def unroll_multihorizon(self, observations, actions):
+        """Multi-horizon teacher-forced training for MultiHorizonRNNPredictor.
+
+        For each horizon k in 1..K, predict z_{t+k} from the ground-truth z_t
+        plus the k intermediate actions, accumulate MSE against the
+        ground-truth z_{t+k}, then average over the horizons that fit in the
+        batch (T_in = T - k > 0). Returns the same 5-tuple as
+        `unroll(compute_loss=True)` so the training loop stays identical.
+        """
+        assert hasattr(self.predictor, "num_horizons"), (
+            "unroll_multihorizon requires a MultiHorizonRNNPredictor"
+        )
+        state = self.encoder(observations)  # [B, D, T, 1, 1]
+        rloss, rloss_unweight, rloss_dict = self.regularizer(state, actions)
+        actions_encoded = (
+            self.action_encoder(actions) if actions is not None else None
+        )
+
+        T = state.size(2)
+        K = self.predictor.num_horizons
+
+        ploss = torch.tensor(0.0, device=state.device)
+        n_terms = 0
+        for k in range(1, K + 1):
+            T_in = T - k
+            if T_in <= 0:
+                continue
+            z_pred = self.predictor.forward_horizon(
+                state[:, :, :T_in], actions_encoded, k
+            )
+            ploss = ploss + self.predcost(z_pred, state[:, :, k:T])
+            n_terms += 1
+        if n_terms > 0:
+            ploss = ploss / n_terms
+
+        loss = rloss + ploss
+        return state, (loss, rloss, rloss_unweight, rloss_dict, ploss)
+
 
 class JEPAProbe(nn.Module):
     """JEPA with a trainable prediction head. The JEPA encoder is kept fixed."""

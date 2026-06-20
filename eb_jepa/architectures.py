@@ -454,6 +454,98 @@ class RNNPredictor(nn.Module):
         return next_state[0].unsqueeze(-1).unsqueeze(-1).unsqueeze(-1)
 
 
+class MultiHorizonRNNPredictor(nn.Module):
+    """K independent GRU predictors for multi-token prediction (MTP).
+
+    Predictor k (1..K) maps z_t and the k actions [a_t,...,a_{t+k-1}] to z_{t+k}
+    by unrolling its GRU for k steps with z_t as the initial hidden state and
+    the actions as the per-step inputs. Used to supervise the latent dynamics at
+    multiple horizons in a single (teacher-forced) training step.
+
+    The standard `forward(state, action)` is a 1-step delegate to predictor 1,
+    so `JEPA.unroll(unroll_mode='autoregressive')` and MPPI/CEM planning work
+    unchanged on this module.
+    """
+
+    def __init__(
+        self,
+        hidden_size: int = 512,
+        action_dim: Optional[int] = 2,
+        num_horizons: int = 4,
+        num_layers: int = 1,
+        final_ln: Optional[torch.nn.Module] = None,
+    ):
+        super().__init__()
+        self.num_horizons = num_horizons
+        self.hidden_size = hidden_size
+        self.action_dim = action_dim
+        # K independent GRU predictors (default-random init)
+        self.predictors = nn.ModuleList(
+            [
+                RNNPredictor(
+                    hidden_size=hidden_size,
+                    action_dim=action_dim,
+                    num_layers=num_layers,
+                    final_ln=final_ln,
+                )
+                for _ in range(num_horizons)
+            ]
+        )
+        self.is_rnn = True
+        self.context_length = 0
+
+    def forward(self, state, action):
+        """1-step prediction → delegates to predictor 1 (planning path)."""
+        return self.predictors[0](state, action)
+
+    def forward_horizon(self, state, actions, k):
+        """Apply predictor k in parallel over every starting position in `state`.
+
+        Args:
+            state: [B, D, T_in, 1, 1] — z_t for each starting position t in 0..T_in-1
+            actions: [B, A, T_actions] — must satisfy T_actions >= T_in + k - 1
+            k: horizon in 1..num_horizons
+        Returns:
+            z_pred: [B, D, T_in, 1, 1] — predicted z_{t+k} for each t
+        """
+        assert 1 <= k <= self.num_horizons
+        B, D, T_in, _, _ = state.shape
+        A = actions.size(1)
+        assert actions.size(2) >= T_in + k - 1, (
+            f"need at least {T_in + k - 1} actions for k={k}, got {actions.size(2)}"
+        )
+
+        # k-action window for each starting position t: actions[:, :, t:t+k]
+        action_windows = actions.unfold(dimension=2, size=k, step=1)[
+            :, :, :T_in
+        ]  # [B, A, T_in, k]
+        rnn_input = (
+            action_windows.permute(3, 0, 2, 1)
+            .reshape(k, B * T_in, A)
+            .contiguous()
+        )  # [k, B*T_in, A]
+
+        # z_t becomes the GRU's initial hidden state
+        h_init = (
+            state.squeeze(-1)
+            .squeeze(-1)  # [B, D, T_in]
+            .permute(0, 2, 1)
+            .reshape(B * T_in, D)
+            .unsqueeze(0)
+            .contiguous()
+        )  # [1, B*T_in, D]
+
+        pred = self.predictors[k - 1]
+        output, _ = pred.rnn(rnn_input, h_init)  # [k, B*T_in, D]
+        z_pred = pred.final_ln(output[-1])  # [B*T_in, D]
+        return (
+            z_pred.view(B, T_in, D)
+            .permute(0, 2, 1)
+            .unsqueeze(-1)
+            .unsqueeze(-1)
+        )  # [B, D, T_in, 1, 1]
+
+
 class InverseDynamicsModel(nn.Module):
     """
     Predicts the action that caused a transition from state_t to state_t_plus_1.
