@@ -54,7 +54,8 @@ def viz(ckpt: str, fname: str = None, out_dir: str = None,
         nf: int = 4, skip: int = 5, probe_iters: int = 1500,
         cache_batches: int = 40, seed: int = 0,
         speculative: bool = True, speculative_threshold: float = 0.05,
-        speculative_metric: str = "normalized_mse", max_draft_steps: int = None):
+        speculative_metric: str = "normalized_mse", max_draft_steps: int = None,
+        gt_decode: str = "z"):
     setup_seed(seed)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     ckpt = Path(ckpt)
@@ -153,9 +154,40 @@ def viz(ckpt: str, fname: str = None, out_dir: str = None,
                    xlabel="rollout step", ylabel="latent MSE")
     logger.info("latent MSE/step: " + " | ".join(f"t{i+1}={v:.3f}" for i, v in enumerate(mse_t)))
 
-    # decode to pixels
+    # Optional: decode the GT-reconstruction column from the raw CLS token, which
+    # encodes the agent even when the prediction latent z has collapsed. Shows a
+    # "good agent" tracking the GT in the Dec-GT column.
+    gt_probe = probe
+    if gt_decode == "cls":
+        with torch.no_grad(), autocast("cuda", dtype=torch.bfloat16):
+            cfeat = enc.encode_cls(frames).float()  # train a CLS->XY probe
+        # reuse cached training features in CLS space
+        cfeats, clocs = [], []
+        it2 = iter(loader)
+        for _ in range(min(cache_batches, 20)):
+            try:
+                xx, aa, ll, *_ = next(it2)
+            except StopIteration:
+                break
+            ff, _, lcc = subtraj(xx.to(device), aa.to(device).float(), ll.to(device), nf, skip)
+            with torch.no_grad(), autocast("cuda", dtype=torch.bfloat16):
+                cfeats.append(enc.encode_cls(ff).float().cpu()); clocs.append(lcc.cpu())
+        cfeats = torch.cat(cfeats); clocs = torch.cat(clocs)
+        gt_probe = MLPXYHead(enc.hidden_dim).to(device)
+        copt = AdamW(gt_probe.parameters(), lr=1e-3); gt_probe.train()
+        for _ in range(probe_iters):
+            bi = torch.randint(0, cfeats.size(0), (min(256, cfeats.size(0)),))
+            z5 = cfeats[bi].to(device).permute(0, 2, 1).unsqueeze(-1).unsqueeze(-1)
+            l = torch.nn.functional.mse_loss(gt_probe(z5), clocs[bi].to(device))
+            copt.zero_grad(); l.backward(); copt.step()
+        gt_probe.eval()
+        cls_gt = enc.encode_cls(frames).float()
+        gt_dec = decode(cls_gt, gt_probe, env, normalizer, wall_x, door_y)
+    else:
+        gt_dec = decode(z, probe, env, normalizer, wall_x, door_y)
+
+    # decode predictions (predictor outputs z-space)
     z0 = z[:, :1]
-    gt_dec = decode(z, probe, env, normalizer, wall_x, door_y)
     pred_seq = decode(torch.cat([z0, pred_true], 1), probe, env, normalizer, wall_x, door_y)
     rand_seq = decode(torch.cat([z0, pred_rand], 1), probe, env, normalizer, wall_x, door_y)
     gt = normalizer.unnormalize_state(frames.permute(0, 2, 1, 3, 4)).permute(0, 1, 3, 4, 2)
