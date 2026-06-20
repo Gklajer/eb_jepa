@@ -67,6 +67,7 @@ def viz(ckpt: str, fname: str = None, out_dir: str = None,
         in_channels=cfg.model.get("in_channels", 2), img_size=cfg.model.get("img_size", 224),
         patch=cfg.model.get("patch", 14), dim=cfg.model.get("enc_dim", 192),
         depth=cfg.model.get("enc_depth", 12), heads=cfg.model.get("enc_heads", 3),
+        use_head=cfg.model.get("use_head", True),
     ).to(device)
     pred = LeWMPredictor(
         latent_dim=enc.hidden_dim, dim=cfg.model.get("pred_dim", 384),

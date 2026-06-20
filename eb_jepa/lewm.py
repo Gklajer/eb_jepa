@@ -58,10 +58,11 @@ class ViTTinyEncoder(nn.Module):
     """
 
     def __init__(self, in_channels=2, img_size=224, patch=14,
-                 dim=192, depth=12, heads=3, mlp_ratio=4.0):
+                 dim=192, depth=12, heads=3, mlp_ratio=4.0, use_head=True):
         super().__init__()
         self.img_size = img_size
         self.hidden_dim = dim
+        self.use_head = use_head
         self.patch_embed = PatchEmbed(img_size, patch, 3, dim)
         self.cls = nn.Parameter(torch.zeros(1, 1, dim))
         self.pos = nn.Parameter(torch.randn(1, self.patch_embed.n + 1, dim) * 0.02)
@@ -70,8 +71,12 @@ class ViTTinyEncoder(nn.Module):
             dropout=0.0, activation="gelu", batch_first=True, norm_first=True,
         )
         self.blocks = nn.TransformerEncoder(layer, num_layers=depth)  # no final LN
-        # Projection head: MLP + BatchNorm (enables SIGReg's anti-collapse).
-        self.head = nn.Linear(dim, dim)
+        # Prediction latent = BN of [CLS] (BN enables SIGReg's anti-collapse).
+        # use_head=True keeps a learnable Linear (paper's "1-layer MLP"); but that
+        # head can rotate the agent direction away under the prediction loss
+        # (observed collapse on two_rooms). use_head=False predicts directly in
+        # CLS space (z = BN(CLS)) so the agent info the encoder captured survives.
+        self.head = nn.Linear(dim, dim) if use_head else None
         self.bn = nn.BatchNorm1d(dim)
         nn.init.trunc_normal_(self.cls, std=0.02)
 
@@ -101,7 +106,8 @@ class ViTTinyEncoder(nn.Module):
         tok = torch.cat([cls, tok], dim=1) + self.pos
         tok = self.blocks(tok)
         cls_raw = tok[:, 0]               # raw last-layer CLS -> [B*T, D]
-        z = self.bn(self.head(cls_raw))   # prediction latent (BN, not LayerNorm)
+        h = self.head(cls_raw) if self.use_head else cls_raw
+        z = self.bn(h)                    # prediction latent (BN, not LayerNorm)
         z = z.reshape(B, T, self.hidden_dim)
         if return_cls:
             return z, cls_raw.reshape(B, T, self.hidden_dim)

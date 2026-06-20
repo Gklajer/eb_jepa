@@ -84,6 +84,7 @@ def run(
         dim=cfg.model.get("enc_dim", 192),
         depth=cfg.model.get("enc_depth", 12),
         heads=cfg.model.get("enc_heads", 3),
+        use_head=cfg.model.get("use_head", True),
     ).to(device)
     mtp = cfg.model.get("mtp_horizon", 1)
     pred = LeWMPredictor(
