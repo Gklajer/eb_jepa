@@ -131,7 +131,7 @@ def lewm_latent_step_distance(draft, verifier, metric="normalized_mse"):
 
 def accepted_prefix_lengths(distances, threshold):
     """Count accepted draft steps before the first verifier mismatch."""
-    accepted = distances <= threshold
+    accepted = (distances <= threshold).to(torch.int64)
     return accepted.cumprod(dim=1).sum(dim=1)
 
 

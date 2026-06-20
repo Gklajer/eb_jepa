@@ -74,7 +74,13 @@ def viz(ckpt: str, fname: str = None, out_dir: str = None,
         action_dim=2, dropout=cfg.model.get("pred_dropout", 0.1),
         mtp=cfg.model.get("mtp_horizon", 1),
     ).to(device)
-    enc.load_state_dict(state["encoder"]); pred.load_state_dict(state["predictor"])
+    enc.load_state_dict(state["encoder"])
+    missing, unexpected = pred.load_state_dict(state["predictor"], strict=False)
+    if missing or unexpected:
+        logger.warning(
+            f"Predictor checkpoint compatibility: missing={missing}, "
+            f"unexpected={unexpected}"
+        )
     enc.eval(); pred.eval()
     logger.info(f"Loaded LeWM ckpt {ckpt} (epoch {state.get('epoch')})")
 
