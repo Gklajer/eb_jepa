@@ -445,13 +445,31 @@ class GCAgent:
         if predictor is None and hasattr(self.model, "_orig_mod"):
             predictor = getattr(self.model._orig_mod, "predictor", None)
         use_direct = getattr(predictor, "direct_multi_horizon", False)
-        unroll_mode = "direct_multi_horizon" if use_direct else "autoregressive"
+        use_self_speculative = (
+            use_direct
+            and self.plan_cfg is not None
+            and self.plan_cfg.planner.get("self_speculative", False)
+        )
+        if use_self_speculative:
+            unroll_mode = "self_speculative"
+        else:
+            unroll_mode = "direct_multi_horizon" if use_direct else "autoregressive"
         if use_direct:
             ctxt_window_time = getattr(predictor, "context_length", 1)
         elif self.plan_cfg:
             ctxt_window_time = self.plan_cfg["ctxt_window_time"]
         else:
             ctxt_window_time = 1
+        unroll_kwargs = {}
+        if use_self_speculative:
+            unroll_kwargs = {
+                "speculative_threshold": self.plan_cfg.planner.get(
+                    "speculative_threshold", 0.05
+                ),
+                "speculative_distance_metric": self.plan_cfg.planner.get(
+                    "speculative_distance_metric", "normalized_mse"
+                ),
+            }
         predicted_states, _ = self.model.unroll(
             obs_init,
             actions,
@@ -460,6 +478,7 @@ class GCAgent:
             ctxt_window_time=ctxt_window_time,
             compute_loss=False,
             return_all_steps=False,
+            **unroll_kwargs,
         )
         return predicted_states
 

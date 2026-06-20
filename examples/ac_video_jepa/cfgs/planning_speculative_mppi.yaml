@@ -1,0 +1,34 @@
+# MPPI with self-speculative latent rollout.
+#
+# The predictor drafts multiple future latents in one direct multi-horizon pass.
+# Each drafted step is verified in latent space by the same predictor called as a
+# one-step verifier on the draft prefix. The valid prefix is kept; after the
+# first mismatch the verifier state is used and the remaining horizon is drafted
+# again from the corrected latent state.
+logging:
+  tqdm_silent: false
+task_specification:
+  goal_source: random_state
+  obs: rgb
+planner:
+  planner_name: mppi
+  self_speculative: true
+  speculative_threshold: 0.05
+  speculative_distance_metric: normalized_mse # normalized_mse | mse | cosine
+  num_act_stepped: 1
+  plan_length: 5 # should match or stay below model.nsteps for best speed
+  n_iters: 20
+  num_samples: 200
+  num_elites: 20
+  max_norms:
+    - 2.45
+  max_norm_dims:
+    - 0
+    - 1
+  var_scale: 1.5
+  decode_each_iteration: false
+  planning_objective:
+    objective_type: repr_dist
+    sum_all_diffs: false
+    alpha: 0.
+ctxt_window_time: 1

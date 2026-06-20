@@ -863,6 +863,64 @@ def test_direct_multi_horizon_unroll_with_loss():
     assert planned.shape == (b, d, context_length + horizon, 1, 1)
 
 
+def test_self_speculative_unroll_latent_verification():
+    """Test self-speculative rollout uses latent draft/verify shapes."""
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    b, d, h, w = 2, 8, 2, 2
+    action_dim = 2
+    horizon = 3
+    context_length = 2
+
+    predictor = CausalMultiHorizonPredictor(
+        encoder_dim=d,
+        action_dim=action_dim,
+        num_patches=1,
+        horizon=horizon,
+        context_length=context_length,
+        pred_dim=16,
+        depth=1,
+        num_heads=4,
+    ).to(device)
+    model = JEPA(
+        encoder=nn.Identity(),
+        aencoder=nn.Identity(),
+        predictor=predictor,
+        regularizer=ZeroRegularizer(),
+        predcost=MultiHorizonLoss(gamma=1.0),
+    ).to(device)
+
+    observations = torch.randn(b, d, 1, h, w, device=device)
+    actions = torch.randn(b, action_dim, horizon, device=device)
+    predicted, losses = model.unroll(
+        observations,
+        actions,
+        nsteps=horizon,
+        unroll_mode="self_speculative",
+        ctxt_window_time=context_length,
+        compute_loss=False,
+        return_all_steps=False,
+        speculative_threshold=0.05,
+        speculative_distance_metric="normalized_mse",
+    )
+
+    assert losses is None
+    assert predicted.shape == (b, d, context_length + horizon, 1, 1)
+    assert model.last_speculative_stats["distance_metric"] == "normalized_mse"
+    assert model.last_speculative_stats["threshold"] == 0.05
+
+    all_steps, _ = model.unroll(
+        observations,
+        actions,
+        nsteps=horizon,
+        unroll_mode="self_speculative",
+        ctxt_window_time=context_length,
+        compute_loss=False,
+        return_all_steps=True,
+    )
+    assert len(all_steps) == horizon
+    assert all_steps[-1].shape == (b, d, context_length + horizon, 1, 1)
+
+
 def run_all_tests():
     """Run all tests for unroll() function."""
     print("\n" + "#" * 60)
@@ -926,6 +984,12 @@ def run_all_tests():
         results["direct multi-horizon unroll"] = "PASSED"
     except AssertionError as e:
         results["direct multi-horizon unroll"] = f"FAILED: {e}"
+
+    try:
+        test_self_speculative_unroll_latent_verification()
+        results["self-speculative latent unroll"] = "PASSED"
+    except AssertionError as e:
+        results["self-speculative latent unroll"] = f"FAILED: {e}"
 
     # Summary
     print("\n" + "#" * 60)

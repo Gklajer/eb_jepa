@@ -1,5 +1,6 @@
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 from eb_jepa.logging import get_logger
 
@@ -11,6 +12,32 @@ def spatial_mean_pool_latents(state):
     if state.dim() != 5:
         return state
     return state.mean(dim=(-2, -1), keepdim=True)
+
+
+def latent_step_distance(draft, verifier, metric="normalized_mse"):
+    """Distance between draft and verifier latent sequences, returned as [B, T]."""
+    if draft.shape != verifier.shape:
+        raise ValueError(
+            "Draft and verifier latent shapes must match: "
+            f"{tuple(draft.shape)} != {tuple(verifier.shape)}"
+        )
+    draft_flat = draft.permute(0, 2, 1, 3, 4).flatten(2)
+    verifier_flat = verifier.permute(0, 2, 1, 3, 4).flatten(2)
+    if metric == "mse":
+        return (draft_flat - verifier_flat).pow(2).mean(dim=2)
+    if metric == "normalized_mse":
+        mse = (draft_flat - verifier_flat).pow(2).mean(dim=2)
+        denom = verifier_flat.pow(2).mean(dim=2).clamp_min(1e-6)
+        return mse / denom
+    if metric == "cosine":
+        return 1.0 - F.cosine_similarity(draft_flat, verifier_flat, dim=2)
+    raise ValueError(f"Unknown speculative latent distance metric: {metric}")
+
+
+def accepted_prefix_lengths(distances, threshold):
+    """Count accepted draft steps before the first verifier mismatch."""
+    accepted = distances <= threshold
+    return accepted.cumprod(dim=1).sum(dim=1)
 
 
 class JEPAbase(nn.Module):
@@ -78,6 +105,8 @@ class JEPA(JEPAbase):
         ctxt_window_time=1,
         compute_loss=True,
         return_all_steps=False,
+        speculative_threshold=0.05,
+        speculative_distance_metric="normalized_mse",
     ):
         """Unified multi-step prediction with optional loss computation.
 
@@ -122,6 +151,8 @@ class JEPA(JEPAbase):
             compute_loss: Whether to compute losses (requires ground truth observations)
             return_all_steps: If True, return list of predictions at each step (like infern).
                 If False, return only the final predicted states.
+            speculative_threshold: Latent distance threshold for self_speculative mode.
+            speculative_distance_metric: "normalized_mse", "mse", or "cosine".
 
         Returns:
             Tuple of (predicted_states, losses) where:
@@ -282,6 +313,36 @@ class JEPA(JEPAbase):
                         )
                     steps_done += chunk
 
+        # Self-speculative latent rollout: draft K future latents directly, verify
+        # the draft in latent space with one-step predictor calls, keep the valid
+        # prefix, and regenerate after the first mismatch.
+        elif unroll_mode == "self_speculative":
+            if compute_loss:
+                raise ValueError("self_speculative is an inference/planning mode only")
+            if actions_encoded is None:
+                raise ValueError("self_speculative requires action inputs")
+            if nsteps > actions_encoded.size(2):
+                raise ValueError(
+                    f"nsteps ({nsteps}) larger than action sequence length "
+                    f"({actions_encoded.size(2)})"
+                )
+            if not getattr(self.predictor, "direct_multi_horizon", False):
+                raise ValueError(
+                    "self_speculative requires a direct_multi_horizon predictor"
+                )
+
+            predicted_states, step_outputs = self._self_speculative_unroll(
+                state=state,
+                actions_encoded=actions_encoded,
+                nsteps=nsteps,
+                ctxt_window_time=ctxt_window_time,
+                threshold=speculative_threshold,
+                distance_metric=speculative_distance_metric,
+                collect_steps=return_all_steps,
+            )
+            if return_all_steps:
+                all_steps.extend(step_outputs)
+
         # Autoregressive mode: step-by-step with sliding window
         # Note: RNN predictors (is_rnn=True) are a special case with ctxt_window_time=1
         elif unroll_mode == "autoregressive":
@@ -329,6 +390,111 @@ class JEPA(JEPAbase):
             return all_steps, losses
         else:
             return predicted_states, losses
+
+    def _self_speculative_unroll(
+        self,
+        state,
+        actions_encoded,
+        nsteps,
+        ctxt_window_time,
+        threshold,
+        distance_metric,
+        collect_steps=False,
+    ):
+        effective_ctxt_window = getattr(
+            self.predictor, "context_length", ctxt_window_time
+        )
+        max_horizon = getattr(self.predictor, "horizon", nsteps)
+        pred_state = self.prediction_state(state)
+
+        if pred_state.size(2) < effective_ctxt_window:
+            pad_count = effective_ctxt_window - pred_state.size(2)
+            pad = pred_state[:, :, :1].expand(-1, -1, pad_count, -1, -1)
+            predicted_states = torch.cat([pad, pred_state], dim=2)
+        else:
+            predicted_states = pred_state[:, :, -effective_ctxt_window:]
+
+        step_outputs = []
+        accepted_counts = []
+        distance_means = []
+        chunks = 0
+        steps_done = 0
+        while steps_done < nsteps:
+            chunk = min(max_horizon, nsteps - steps_done)
+            context_states = predicted_states[:, :, -effective_ctxt_window:]
+            chunk_actions = actions_encoded[:, :, steps_done : steps_done + chunk]
+
+            draft_future = self.predictor(context_states, chunk_actions)
+            verifier_future = self._verify_draft_future(
+                context_states=context_states,
+                draft_future=draft_future,
+                chunk_actions=chunk_actions,
+                context_length=effective_ctxt_window,
+            )
+            distances = latent_step_distance(
+                draft_future, verifier_future, metric=distance_metric
+            )
+            accepted_prefix = accepted_prefix_lengths(distances, threshold)
+            advance_per_item = torch.clamp(accepted_prefix + 1, max=chunk)
+            advance = int(advance_per_item.min().item())
+            advance = max(1, advance)
+
+            accepted_counts.append(accepted_prefix.float().mean().detach())
+            distance_means.append(distances.mean().detach())
+            chunks += 1
+
+            for local_step in range(advance):
+                use_draft = (local_step < accepted_prefix).view(-1, 1, 1, 1, 1)
+                next_state = torch.where(
+                    use_draft,
+                    draft_future[:, :, local_step : local_step + 1],
+                    verifier_future[:, :, local_step : local_step + 1],
+                )
+                predicted_states = torch.cat([predicted_states, next_state], dim=2)
+                if collect_steps:
+                    step_outputs.append(predicted_states.clone())
+
+            steps_done += advance
+
+        if accepted_counts:
+            mean_accepted_prefix = torch.stack(accepted_counts).mean().item()
+            mean_verify_distance = torch.stack(distance_means).mean().item()
+        else:
+            mean_accepted_prefix = 0.0
+            mean_verify_distance = 0.0
+        self.last_speculative_stats = {
+            "chunks": chunks,
+            "mean_accepted_prefix": mean_accepted_prefix,
+            "mean_verify_distance": mean_verify_distance,
+            "threshold": float(threshold),
+            "distance_metric": distance_metric,
+        }
+        return predicted_states, step_outputs
+
+    def _verify_draft_future(
+        self,
+        context_states,
+        draft_future,
+        chunk_actions,
+        context_length,
+    ):
+        batch_size, dim, chunk, height, width = draft_future.shape
+        tentative = torch.cat([context_states, draft_future], dim=2)
+        verifier_contexts = []
+        verifier_actions = []
+        for step in range(chunk):
+            verifier_contexts.append(tentative[:, :, step : step + context_length])
+            verifier_actions.append(chunk_actions[:, :, step : step + 1])
+
+        flat_contexts = torch.cat(verifier_contexts, dim=0)
+        flat_actions = torch.cat(verifier_actions, dim=0)
+        verifier_flat = self.predictor(flat_contexts, flat_actions)[:, :, :1]
+        verifier_future = (
+            verifier_flat.reshape(chunk, batch_size, dim, 1, height, width)
+            .permute(1, 2, 0, 3, 4, 5)
+            .reshape(batch_size, dim, chunk, height, width)
+        )
+        return verifier_future
 
 
 class JEPAProbe(nn.Module):
