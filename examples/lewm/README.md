@@ -64,8 +64,12 @@ verifies them with the horizon-1 head in latent space, keeps the accepted prefix
 and regenerates only after the first mismatch.
 
 <p align="center">
-  <img src="../../comparison_planning_arbase.gif" alt="Autoregressive baseline versus self-speculative multi-token latent planning" width="760">
+  <a href="https://drive.google.com/file/d/1C-b7P4qfm0bqwhGlkA1_6Oakre0zt-V6/view?usp=sharing">
+    <img src="../../rename_gif.png" alt="Autoregressive baseline versus self-speculative multi-token latent planning" width="760">
+  </a>
 </p>
+
+The image links to the animated result video.
 
 At each chunk:
 
