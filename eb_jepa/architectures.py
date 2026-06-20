@@ -502,7 +502,8 @@ class CausalMultiHorizonPredictor(nn.Module):
 
     The predictor is direct multi-horizon: all horizons are produced by one forward
     pass, while the attention mask ensures horizon h only has access to the action
-    prefix needed to reach that horizon.
+    prefix needed to reach that horizon. When configured with one patch, JEPA's
+    direct multi-horizon path mean-pools encoder feature maps before prediction.
     """
 
     def __init__(
@@ -533,6 +534,7 @@ class CausalMultiHorizonPredictor(nn.Module):
         self.pred_dim = pred_dim
         self.is_rnn = False
         self.direct_multi_horizon = True
+        self.spatial_pool = num_patches == 1
 
         self.z_proj = nn.Linear(encoder_dim, pred_dim)
         self.action_proj = nn.Linear(action_dim, pred_dim)
@@ -580,6 +582,10 @@ class CausalMultiHorizonPredictor(nn.Module):
         b, d, context_len, h, w = state.shape
         _, action_dim, horizon = action.shape
         num_patches = h * w
+        if self.spatial_pool and num_patches != 1:
+            state = state.mean(dim=(-2, -1), keepdim=True)
+            h = w = 1
+            num_patches = 1
         if d != self.encoder_dim:
             raise ValueError(f"Expected state dim {self.encoder_dim}, got {d}")
         if action_dim != self.action_dim:

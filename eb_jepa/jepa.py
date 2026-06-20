@@ -6,6 +6,13 @@ from eb_jepa.logging import get_logger
 logging = get_logger(__name__)
 
 
+def spatial_mean_pool_latents(state):
+    """Pool spatial latent maps to one global token per frame."""
+    if state.dim() != 5:
+        return state
+    return state.mean(dim=(-2, -1), keepdim=True)
+
+
 class JEPAbase(nn.Module):
     """Base JEPA class for planning and inference only. Use JEPA subclass for training."""
 
@@ -30,6 +37,12 @@ class JEPAbase(nn.Module):
     def encode(self, observations):
         """Encode a sequence of observations and return the encoder output."""
         return self.encoder(observations)
+
+    def prediction_state(self, state):
+        """Return the latent representation expected by the predictor."""
+        if getattr(self.predictor, "spatial_pool", False):
+            return spatial_mean_pool_latents(state)
+        return state
 
 
 class JEPA(JEPAbase):
@@ -171,16 +184,17 @@ class JEPA(JEPAbase):
                 self.predictor, "context_length", ctxt_window_time
             )
             max_horizon = getattr(self.predictor, "horizon", nsteps)
+            pred_state = self.prediction_state(state)
 
             if compute_loss:
                 num_windows = min(
-                    state.size(2) - effective_ctxt_window - nsteps + 1,
+                    pred_state.size(2) - effective_ctxt_window - nsteps + 1,
                     actions_encoded.size(2) - effective_ctxt_window - nsteps + 2,
                 )
                 if num_windows <= 0:
                     raise ValueError(
                         "Not enough timesteps for direct_multi_horizon training: "
-                        f"T_state={state.size(2)}, T_actions={actions_encoded.size(2)}, "
+                        f"T_state={pred_state.size(2)}, T_actions={actions_encoded.size(2)}, "
                         f"context={effective_ctxt_window}, nsteps={nsteps}"
                     )
 
@@ -190,13 +204,13 @@ class JEPA(JEPAbase):
                 for start in range(num_windows):
                     action_start = start + effective_ctxt_window - 1
                     context_batches.append(
-                        state[:, :, start : start + effective_ctxt_window]
+                        pred_state[:, :, start : start + effective_ctxt_window]
                     )
                     action_batches.append(
                         actions_encoded[:, :, action_start : action_start + nsteps]
                     )
                     target_batches.append(
-                        state[
+                        pred_state[
                             :,
                             :,
                             start
@@ -215,7 +229,7 @@ class JEPA(JEPAbase):
                 # Return the first window in the usual [B, D, T, H, W] style.
                 predicted_states = torch.cat(
                     [
-                        state[:, :, :effective_ctxt_window],
+                        pred_state[:, :, :effective_ctxt_window],
                         predicted_future[: state.size(0)],
                     ],
                     dim=2,
@@ -225,7 +239,7 @@ class JEPA(JEPAbase):
                         [
                             torch.cat(
                                 [
-                                    state[:, :, :effective_ctxt_window],
+                                    pred_state[:, :, :effective_ctxt_window],
                                     predicted_future[: state.size(0), :, : h + 1],
                                 ],
                                 dim=2,
@@ -234,12 +248,12 @@ class JEPA(JEPAbase):
                         ]
                     )
             else:
-                if state.size(2) < effective_ctxt_window:
-                    pad_count = effective_ctxt_window - state.size(2)
-                    pad = state[:, :, :1].expand(-1, -1, pad_count, -1, -1)
-                    context_states = torch.cat([pad, state], dim=2)
+                if pred_state.size(2) < effective_ctxt_window:
+                    pad_count = effective_ctxt_window - pred_state.size(2)
+                    pad = pred_state[:, :, :1].expand(-1, -1, pad_count, -1, -1)
+                    context_states = torch.cat([pad, pred_state], dim=2)
                 else:
-                    context_states = state[:, :, -effective_ctxt_window:]
+                    context_states = pred_state[:, :, -effective_ctxt_window:]
 
                 predicted_states = context_states
                 steps_done = 0

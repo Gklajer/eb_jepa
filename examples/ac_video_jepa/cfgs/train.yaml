@@ -37,7 +37,7 @@ model:
   predictor_heads: 8
   predictor_mlp_ratio: 4.0
   predictor_dropout: 0.0
-  horizon_loss_gamma: 0.5
+  horizon_loss_gamma: 1.0
   horizon_loss_type: smooth_l1 # smooth_l1 | l1 | mse
   encoder_architecture: impala # impala | resnet | conv
   train_rollout: last # last | all

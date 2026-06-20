@@ -27,13 +27,13 @@ class SquareLossSeq(nn.Module):
 
 
 class MultiHorizonLoss(nn.Module):
-    """Weighted direct multi-horizon prediction loss.
+    """Direct multi-horizon prediction loss.
 
-    Inputs are expected as [B, C, K, H, W]. The horizon dimension K is weighted
-    increasingly toward the terminal prediction by default.
+    Inputs are expected as [B, C, K, H, W]. Horizons are weighted uniformly by
+    default. Passing gamma < 1 gives relatively more weight to later horizons.
     """
 
-    def __init__(self, gamma=0.5, loss_type="smooth_l1", weights=None, proj=None):
+    def __init__(self, gamma=1.0, loss_type="smooth_l1", weights=None, proj=None):
         super().__init__()
         self.gamma = gamma
         self.loss_type = loss_type
@@ -47,13 +47,13 @@ class MultiHorizonLoss(nn.Module):
                 raise ValueError(
                     f"Expected {horizon} horizon weights, got {weights.numel()}"
                 )
-            return weights / weights[-1].clamp_min(1e-12)
+            return weights / weights.sum().clamp_min(1e-12)
         weights = torch.tensor(
             [self.gamma ** (horizon - 1 - h) for h in range(horizon)],
             device=device,
             dtype=dtype,
         )
-        return weights / weights[-1].clamp_min(1e-12)
+        return weights / weights.sum().clamp_min(1e-12)
 
     def forward(self, state, predi):
         b, c, k, h, w = state.shape

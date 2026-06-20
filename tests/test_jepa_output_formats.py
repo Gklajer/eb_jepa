@@ -816,7 +816,7 @@ def test_direct_multi_horizon_unroll_with_loss():
     predictor = CausalMultiHorizonPredictor(
         encoder_dim=d,
         action_dim=action_dim,
-        num_patches=h * w,
+        num_patches=1,
         horizon=horizon,
         context_length=context_length,
         pred_dim=16,
@@ -828,7 +828,7 @@ def test_direct_multi_horizon_unroll_with_loss():
         aencoder=nn.Identity(),
         predictor=predictor,
         regularizer=ZeroRegularizer(),
-        predcost=MultiHorizonLoss(gamma=0.5),
+        predcost=MultiHorizonLoss(gamma=1.0),
     ).to(device)
 
     observations = torch.randn(b, d, t, h, w, device=device)
@@ -843,7 +843,7 @@ def test_direct_multi_horizon_unroll_with_loss():
         return_all_steps=False,
     )
 
-    assert predicted.shape == (b, d, context_length + horizon, h, w)
+    assert predicted.shape == (b, d, context_length + horizon, 1, 1)
     assert losses is not None
     total_loss, reg_loss, _, _, pred_loss = losses
     assert torch.isfinite(total_loss)
@@ -860,7 +860,7 @@ def test_direct_multi_horizon_unroll_with_loss():
         return_all_steps=False,
     )
     assert plan_losses is None
-    assert planned.shape == (b, d, context_length + horizon, h, w)
+    assert planned.shape == (b, d, context_length + horizon, 1, 1)
 
 
 def run_all_tests():

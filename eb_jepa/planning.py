@@ -10,6 +10,7 @@ from einops import rearrange
 from omegaconf import OmegaConf
 from tqdm import tqdm
 
+from eb_jepa.jepa import spatial_mean_pool_latents
 from eb_jepa.logging import get_logger
 from eb_jepa.vis_utils import (
     analyze_distances,
@@ -29,6 +30,20 @@ planner_name_map = {
 objective_name_map = {
     "repr_dist": "ReprTargetDistMPCObjective",
 }
+
+
+def _get_model_predictor(model):
+    predictor = getattr(model, "predictor", None)
+    if predictor is None and hasattr(model, "_orig_mod"):
+        predictor = getattr(model._orig_mod, "predictor", None)
+    return predictor
+
+
+def _pool_for_predictor(model, encodings):
+    predictor = _get_model_predictor(model)
+    if getattr(predictor, "spatial_pool", False):
+        return spatial_mean_pool_latents(encodings)
+    return encodings
 
 
 def main_unroll_eval(
@@ -92,13 +107,17 @@ def main_unroll_eval(
                 .unflatten(dim=0, sizes=(B, -1))
                 .permute(0, 2, 1, 3, 4)
             )
+            gt_encoded_eval = _pool_for_predictor(model, gt_encoded)
             latent_mse = (
-                ((gt_encoded - predicted_states) ** 2).mean(dim=(1, 3, 4)).cpu().numpy()
+                ((gt_encoded_eval - predicted_states) ** 2)
+                .mean(dim=(1, 3, 4))
+                .cpu()
+                .numpy()
             )  # B T
             mse_values.append(latent_mse)
 
             if prober:
-                gt_decoded = agent.decode_loc_to_pixel(gt_encoded, wall_x, door_y)
+                gt_decoded = agent.decode_loc_to_pixel(gt_encoded_eval, wall_x, door_y)
                 pred_decoded = agent.decode_loc_to_pixel(
                     predicted_states, wall_x, door_y
                 )
@@ -396,6 +415,7 @@ class GCAgent:
             .unsqueeze(0)
             .unsqueeze(2)
         )
+        self.goal_state_enc = _pool_for_predictor(self.model, self.goal_state_enc)
         objective_name = self.plan_cfg.planner.planning_objective.get(
             "objective_type", "repr_target_dist"
         )
@@ -500,6 +520,9 @@ class ReprTargetDistMPCObjective:
         if self.sum_all_diffs:
             keepdims = True
         target = self.target_enc
+        if target.shape[-2:] != encodings.shape[-2:]:
+            target = spatial_mean_pool_latents(target)
+            encodings = spatial_mean_pool_latents(encodings)
         if target.shape != encodings.shape:
             target = target.expand(encodings.shape[0], -1, encodings.shape[2], -1, -1)
 

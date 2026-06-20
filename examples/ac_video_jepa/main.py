@@ -195,7 +195,7 @@ def run(
         predictor = CausalMultiHorizonPredictor(
             encoder_dim=encoder.mlp_output_dim,
             action_dim=2,
-            num_patches=h * w,
+            num_patches=1,
             horizon=cfg.model.nsteps,
             context_length=cfg.model.get("context_length", 1),
             pred_dim=cfg.model.get("pred_dim", encoder.mlp_output_dim),
@@ -235,8 +235,14 @@ def run(
         sim_t_after_proj=cfg.model.regularizer.sim_t_after_proj,
     )
     if unroll_mode == "direct_multi_horizon":
+        logger.info(
+            "Direct multi-horizon tokenization: "
+            f"mean-pool encoder spatial map {h}x{w} to 1 latent token per frame; "
+            f"{cfg.model.nsteps} action token(s); "
+            f"{cfg.model.nsteps} future query token(s)"
+        )
         ploss = MultiHorizonLoss(
-            gamma=cfg.model.get("horizon_loss_gamma", 0.5),
+            gamma=cfg.model.get("horizon_loss_gamma", 1.0),
             loss_type=cfg.model.get("horizon_loss_type", "smooth_l1"),
         )
     else:

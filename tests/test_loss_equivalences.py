@@ -16,6 +16,7 @@ import torch.nn.functional as F
 from eb_jepa.losses import (
     CovarianceLoss,
     HingeStdLoss,
+    MultiHorizonLoss,
     VCLoss,
     VICRegLoss,
 )
@@ -247,6 +248,30 @@ class TestVCLoss:
             assert torch.allclose(
                 loss1, loss2, atol=1e-7
             ), f"Seed {seed}: loss should be deterministic, got {loss1.item():.6f} vs {loss2.item():.6f}"
+
+
+class TestMultiHorizonLoss:
+    """Test direct multi-horizon loss weighting."""
+
+    def test_uniform_gamma_averages_horizons(self):
+        state = torch.tensor([[[[[1.0]], [[2.0]], [[3.0]]]]])
+        pred = torch.zeros_like(state)
+
+        loss = MultiHorizonLoss(gamma=1.0, loss_type="mse")(state, pred)
+
+        expected = torch.tensor((1.0 + 4.0 + 9.0) / 3.0)
+        assert torch.allclose(loss, expected)
+
+    def test_geometric_gamma_uses_normalized_weights(self):
+        state = torch.tensor([[[[[1.0]], [[2.0]], [[3.0]]]]])
+        pred = torch.zeros_like(state)
+
+        loss = MultiHorizonLoss(gamma=0.5, loss_type="mse")(state, pred)
+
+        weights = torch.tensor([0.25, 0.5, 1.0])
+        weights = weights / weights.sum()
+        expected = (torch.tensor([1.0, 4.0, 9.0]) * weights).sum()
+        assert torch.allclose(loss, expected)
 
 
 class TestVICRegLossRegression:

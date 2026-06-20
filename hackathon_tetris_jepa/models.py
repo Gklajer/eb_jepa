@@ -33,7 +33,7 @@ class TetrisModelConfig:
     predictor_heads: int = 4
     predictor_mlp_ratio: float = 4.0
     predictor_dropout: float = 0.0
-    horizon_loss_gamma: float = 0.5
+    horizon_loss_gamma: float = 1.0
     horizon_loss_type: str = "smooth_l1"
     cov_coeff: float = 1.0
     std_coeff: float = 1.0

@@ -240,7 +240,7 @@ class CausalMultiHorizonPredictor(nn.Module):
     ...
 \end{lstlisting}
 
-Son interface est :
+Son interface interne accepte :
 
 \begin{lstlisting}[language=Python]
 state:  [B, D, context, H, W]
@@ -248,7 +248,15 @@ action: [B, A, K]
 return: [B, D, K, H, W]
 \end{lstlisting}
 
-Dans le cas actuel de l'encodeur Impala, la représentation est globale :
+Dans le chemin AC direct utilisé ici, si l'encodeur produit une carte spatiale
+\([B,D,T,H,W]\), cette carte est d'abord moyennée spatialement :
+
+\[
+[B,D,T,H,W] \rightarrow [B,D,T,1,1]
+\]
+
+Le prédicteur reçoit donc un token global par image. Dans le cas actuel de l'encodeur
+Impala, la représentation est déjà globale :
 
 \[
 z_t \in \mathbb{R}^{512 \times 1 \times 1}
@@ -262,8 +270,8 @@ Donc le prédicteur travaille principalement avec :
 [B, 512, K, 1, 1]
 \]
 
-Mais l'implémentation supporte aussi plusieurs patches latents si un futur encodeur
-produit une carte spatiale \(H \times W\).
+Une variante dense par patches resterait possible en configurant le prédicteur avec
+plusieurs tokens spatiaux, mais ce n'est pas le comportement par défaut de ce projet.
 
 \section{Nouveau mode dans \code{JEPA.unroll}}
 
@@ -359,27 +367,26 @@ pred:   [B, D, K, H, W]
 target: [B, D, K, H, W]
 \end{lstlisting}
 
-Elle applique une loss par horizon, puis pondère les horizons avec des poids croissants
-vers le terminal.
+Elle applique une loss par horizon, puis moyenne les horizons avec des poids uniformes
+par défaut.
 
 Par défaut :
 
 \[
-\gamma = 0.5
+\gamma = 1.0
 \]
 
-Pour \(K=5\), les poids sont équivalents à :
+Pour \(K=5\), les poids normalisés sont équivalents à :
 
 \[
-[0.0625,\;0.125,\;0.25,\;0.5,\;1.0]
+[0.2,\;0.2,\;0.2,\;0.2,\;0.2]
 \]
 
 \subsection{Raison du choix}
 
-Le terminal est le plus important pour le MPC, car le coût principal compare souvent
-\(\hat z_{t+K}\) au but. Les horizons intermédiaires restent utiles comme supervision
-auxiliaire : ils forcent le modèle à apprendre une trajectoire latente plausible et pas
-seulement une association directe entre une séquence d'actions et un état final.
+La pondération uniforme force le modèle à apprendre une dynamique cohérente à chaque
+horizon, plutôt qu'à privilégier uniquement le latent terminal. Cela réduit le risque
+d'apprendre un raccourci entre une séquence d'actions et un état final plausible.
 
 \section{Branchement dans AC Video JEPA}
 
@@ -436,7 +443,7 @@ context_length: 1
 pred_dim: 512
 predictor_depth: 4
 predictor_heads: 8
-horizon_loss_gamma: 0.5
+horizon_loss_gamma: 1.0
 horizon_loss_type: smooth_l1
 \end{lstlisting}
 
@@ -594,17 +601,17 @@ G(z_{t-c+1:t}, a_t,\dots,a_{t+K-1})
 alors il faudra ajouter une mémoire d'observations dans \code{GCAgent}, afin que le MPC
 fournisse les derniers états réels au modèle au lieu d'un contexte paddé.
 
-\subsection{Encodeur Impala global}
+\subsection{Pooling spatial avant prédiction}
 
-L'encodeur actuel produit une représentation globale :
+L'encodeur Impala actuel produit déjà une représentation globale :
 
 \[
 [B, 512, T, 1, 1]
 \]
 
-Donc le mécanisme query par patch fonctionne, mais avec un seul patch. Si l'on veut se
-rapprocher davantage de V-JEPA 2, il faudra probablement utiliser un encodeur qui conserve
-une grille de tokens spatiaux.
+Si un encodeur V-JEPA/V-JEPA2 dense est branché plus tard et produit une grille de tokens
+spatiaux, le chemin \code{direct\_multi\_horizon} applique maintenant un mean pooling
+sur \(H,W\) avant le prédicteur et avant la loss de prédiction.
 
 \subsection{Comparaison expérimentale à faire}
 

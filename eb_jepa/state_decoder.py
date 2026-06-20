@@ -19,6 +19,9 @@ class MLPXYHead(nn.Module):
             pred: [B, 2, T]
         """
         bs, c, t, h, w = x.shape
+        if h != 1 or w != 1:
+            x = x.mean(dim=(-2, -1), keepdim=True)
+            h = w = 1
 
         x = x.permute(0, 2, 1, 3, 4)  # [B, T, C, H, W]
         x = x.reshape(bs * t, c, h, w)  # [B*T, C, H, W]
