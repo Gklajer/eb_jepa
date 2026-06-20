@@ -146,37 +146,55 @@ class LeWMPredictor(nn.Module):
     from the history of state latents z_{≤t} conditioned on action a_t."""
 
     def __init__(self, latent_dim=192, dim=384, depth=6, heads=6,
-                 action_dim=2, max_len=64, dropout=0.1):
+                 action_dim=2, max_len=64, dropout=0.1, mtp=1):
         super().__init__()
+        self.mtp = mtp
         self.in_proj = nn.Linear(latent_dim, dim)
         self.act_proj = nn.Linear(action_dim, dim)
         self.pos = nn.Parameter(torch.randn(1, max_len, dim) * 0.02)
         self.blocks = nn.ModuleList(
             [AdaLNBlock(dim, heads, dropout=dropout) for _ in range(depth)]
         )
-        # Output head: MLP + BatchNorm, same structure as the encoder head.
-        self.out = nn.Linear(dim, latent_dim)
-        self.bn = nn.BatchNorm1d(latent_dim)
+        # Output head(s): Linear + BatchNorm, same structure as the encoder head.
+        # mtp==1: single next-step head (names kept for checkpoint compat).
+        # mtp>1 : K Multi-Token-Prediction heads, head k -> z_{t+1+k}.
+        if mtp == 1:
+            self.out = nn.Linear(dim, latent_dim)
+            self.bn = nn.BatchNorm1d(latent_dim)
+        else:
+            self.heads = nn.ModuleList([nn.Linear(dim, latent_dim) for _ in range(mtp)])
+            self.bns = nn.ModuleList([nn.BatchNorm1d(latent_dim) for _ in range(mtp)])
 
-    def forward(self, states, actions):
-        # states: [B, L, latent], actions: [B, L, A] -> preds [B, L, latent]
+    def _trunk(self, states, actions):
         B, L, _ = states.shape
         x = self.in_proj(states) + self.pos[:, :L]
         cond = self.act_proj(actions)
         mask = torch.triu(torch.ones(L, L, device=states.device, dtype=torch.bool), 1)
         for blk in self.blocks:
             x = blk(x, cond, mask)
-        out = self.out(x)
-        out = self.bn(out.reshape(B * L, -1)).reshape(B, L, -1)
-        return out
+        return x, B, L
+
+    def forward(self, states, actions):
+        # states: [B,L,latent], actions: [B,L,A]
+        # -> [B,L,latent] (mtp==1) or [B,L,K,latent] (mtp>1)
+        x, B, L = self._trunk(states, actions)
+        if self.mtp == 1:
+            out = self.bn(self.out(x).reshape(B * L, -1)).reshape(B, L, -1)
+            return out
+        outs = [self.bns[k](self.heads[k](x).reshape(B * L, -1)).reshape(B, L, -1)
+                for k in range(self.mtp)]
+        return torch.stack(outs, dim=2)  # [B, L, K, latent]
 
     @torch.no_grad()
     def rollout(self, first_state, actions, nsteps):
-        """Autoregressive rollout. first_state [B,1,D], actions [B,>=nsteps,A]."""
+        """Autoregressive 1-step rollout (uses head k=0 if MTP). first_state
+        [B,1,D], actions [B,>=nsteps,A]."""
         seq = first_state
         preds = []
         for i in range(nsteps):
             out = self.forward(seq, actions[:, : seq.size(1)])
+            if self.mtp > 1:
+                out = out[:, :, 0]               # k=0 (next-step) head -> [B,L,D]
             nxt = out[:, -1:, :]
             preds.append(nxt)
             seq = torch.cat([seq, nxt], dim=1)
@@ -205,5 +223,26 @@ def lewm_loss(pred, target, all_z, lmbd=0.1, num_proj=1024, step=0):
     the sole anti-collapse mechanism)."""
     l_pred = F.mse_loss(pred, target)
     l_reg = sigreg(all_z, num_proj=num_proj, step=step)
+    total = l_pred + lmbd * l_reg
+    return total, {"loss_pred": l_pred.detach(), "loss_sigreg": l_reg.detach()}
+
+
+def lewm_mtp_loss(preds, z, lmbd=0.1, num_proj=1024, step=0):
+    """Multi-Token-Prediction LeWM loss. preds: [B, L, K, D] where head k at
+    position t predicts z_{t+1+k}; z: [B, nf, D] (L = nf-1). The prediction term
+    averages MSE over all valid (position, head) pairs; SIGReg unchanged."""
+    B, L, K, D = preds.shape
+    nf = z.size(1)
+    l_pred, cnt = 0.0, 0
+    for k in range(K):
+        tmax = nf - 2 - k                       # last position with a z_{t+1+k} target
+        if tmax < 0:
+            break
+        p = preds[:, : tmax + 1, k]             # [B, tmax+1, D]
+        tg = z[:, 1 + k: 1 + k + tmax + 1]      # [B, tmax+1, D]
+        l_pred = l_pred + F.mse_loss(p, tg)
+        cnt += 1
+    l_pred = l_pred / max(cnt, 1)
+    l_reg = sigreg(z.reshape(-1, D), num_proj=num_proj, step=step)
     total = l_pred + lmbd * l_reg
     return total, {"loss_pred": l_pred.detach(), "loss_sigreg": l_reg.detach()}

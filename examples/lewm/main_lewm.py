@@ -25,7 +25,7 @@ from torch.optim import AdamW
 from tqdm import tqdm
 
 from eb_jepa.datasets.utils import init_data
-from eb_jepa.lewm import LeWMPredictor, ViTTinyEncoder, lewm_loss
+from eb_jepa.lewm import LeWMPredictor, ViTTinyEncoder, lewm_loss, lewm_mtp_loss
 from eb_jepa.logging import get_logger
 from eb_jepa.schedulers import CosineWithWarmup
 from eb_jepa.training_utils import load_config, setup_seed
@@ -85,6 +85,7 @@ def run(
         depth=cfg.model.get("enc_depth", 12),
         heads=cfg.model.get("enc_heads", 3),
     ).to(device)
+    mtp = cfg.model.get("mtp_horizon", 1)
     pred = LeWMPredictor(
         latent_dim=enc.hidden_dim,
         dim=cfg.model.get("pred_dim", 384),
@@ -92,7 +93,9 @@ def run(
         heads=cfg.model.get("pred_heads", 6),
         action_dim=2,
         dropout=cfg.model.get("pred_dropout", 0.1),
+        mtp=mtp,
     ).to(device)
+    logger.info(f"MTP heads: {mtp}")
     n_params = sum(p.numel() for p in enc.parameters()) + sum(p.numel() for p in pred.parameters())
     logger.info(f"LeWM params: {n_params/1e6:.1f}M (enc={sum(p.numel() for p in enc.parameters())/1e6:.1f}M)")
 
@@ -122,13 +125,15 @@ def run(
             # SIGReg) computed in fp32 for numerical safety.
             with autocast("cuda", dtype=torch.bfloat16, enabled=cfg.training.get("use_amp", True)):
                 z = enc(frames)                            # [B, nf, D]  (end-to-end)
-                preds = pred(z[:, :-1], blocks)            # [B, nf-1, D]
+                preds = pred(z[:, :-1], blocks)            # [B,nf-1,D] or [B,nf-1,K,D]
             z = z.float(); preds = preds.float()
-            target = z[:, 1:]                              # NO stop-grad
-            loss, parts = lewm_loss(
-                preds, target, z.reshape(-1, z.size(-1)),
-                lmbd=lmbd, num_proj=num_proj, step=gstep,
-            )
+            if mtp > 1:
+                loss, parts = lewm_mtp_loss(
+                    preds, z, lmbd=lmbd, num_proj=num_proj, step=gstep)
+            else:
+                loss, parts = lewm_loss(
+                    preds, z[:, 1:], z.reshape(-1, z.size(-1)),
+                    lmbd=lmbd, num_proj=num_proj, step=gstep)
 
             opt.zero_grad()
             loss.backward()
