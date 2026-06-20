@@ -89,7 +89,10 @@ class ViTTinyEncoder(nn.Module):
                               mode="bilinear", align_corners=False)
         return (x - self.mean) / self.std
 
-    def forward(self, x):  # [B, C, T, H, W] -> [B, T, D]
+    def forward(self, x, return_cls=False):  # [B, C, T, H, W] -> [B, T, D]
+        """Returns the prediction latent z = BN(head(CLS)). With return_cls=True,
+        also returns the RAW last-layer [CLS] token (pre-head, pre-BN) — the
+        representation the paper decodes for visualization/probing."""
         B, C, T, H, W = x.shape
         x = x.permute(0, 2, 1, 3, 4).reshape(B * T, C, H, W)
         x = self._adapt(x)
@@ -97,9 +100,15 @@ class ViTTinyEncoder(nn.Module):
         cls = self.cls.expand(tok.size(0), -1, -1)
         tok = torch.cat([cls, tok], dim=1) + self.pos
         tok = self.blocks(tok)
-        z = self.head(tok[:, 0])          # CLS -> [B*T, D]
-        z = self.bn(z)                    # BatchNorm (not LayerNorm)
-        return z.reshape(B, T, self.hidden_dim)
+        cls_raw = tok[:, 0]               # raw last-layer CLS -> [B*T, D]
+        z = self.bn(self.head(cls_raw))   # prediction latent (BN, not LayerNorm)
+        z = z.reshape(B, T, self.hidden_dim)
+        if return_cls:
+            return z, cls_raw.reshape(B, T, self.hidden_dim)
+        return z
+
+    def encode_cls(self, x):  # [B,C,T,H,W] -> raw [CLS] [B,T,D]
+        return self.forward(x, return_cls=True)[1]
 
 
 # ---------------------------------------------------------------------------
