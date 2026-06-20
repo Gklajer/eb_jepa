@@ -19,8 +19,6 @@ planner:
     - 1
   var_scale: 1.5
   decode_each_iteration: false
-  action_l2_coeff: 0.01
-  action_smoothness_coeff: 0.05
   planning_objective:
     objective_type: repr_dist
     sum_all_diffs: false
