@@ -1,0 +1,51 @@
+# LeWorldModel (arXiv:2603.19312) — simplified maze.
+# Maze shrunk to 13x13 (vs default 21x21) and a shorter window so A* paths stay
+# short — "pas trop complexe". frame_skip 3 (vs 5 on two_rooms) to fit the window.
+logging:
+  log_wandb: true
+  wandb_project: lewm
+  wandb_name: lewm_maze
+  log_every: 10
+  tqdm_silent: false
+meta:
+  seed: 1
+data:
+  env_name: maze
+  batch_size: 128
+  num_workers: 8
+  pin_mem: true
+  persistent_workers: false
+  size: 20000
+  val_size: 1000
+  # --- simplified maze geometry ---
+  maze_height: 13      # was 21
+  maze_width: 13       # was 21
+  cell_size: 3         # img_size = 13*3 = 39
+  sample_length: 13    # shorter training window
+  min_path_length: 14  # must be >= sample_length + 1
+  pipeline:
+    mode: online
+training:
+  use_amp: true
+  dtype: bfloat16
+model:
+  in_channels: 2
+  img_size: 224
+  patch: 14
+  enc_dim: 192
+  enc_depth: 12
+  enc_heads: 3
+  pred_dim: 384
+  pred_depth: 6
+  pred_heads: 6
+  pred_dropout: 0.1
+  num_frames: 4
+  frame_skip: 3        # 4 frames at skip 3 -> indices 0,3,6,9 (< sample_length 13)
+optim:
+  epochs: 10
+  lr: 3.e-4
+  weight_decay: 1.e-4
+  warmup_ratio: 0.05
+  grad_clip: 1.0
+  sigreg_lambda: 0.1
+  sigreg_proj: 1024

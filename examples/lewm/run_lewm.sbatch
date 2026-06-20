@@ -33,6 +33,6 @@ export WANDB_MODE="${WANDB_MODE:-online}" \
 echo "Host: $(hostname)"; echo "GPUs: $(nvidia-smi -L)"
 
 srun "$PY" -m examples.lewm.main_lewm \
-    --fname examples/lewm/cfgs/lewm_two_rooms.yaml \
+    --fname "${CFG:-examples/lewm/cfgs/lewm_two_rooms.yaml}" \
     --folder "$RUN_DIR" \
     ${EXTRA:-}
