@@ -94,8 +94,9 @@ def run(
         action_dim=2,
         dropout=cfg.model.get("pred_dropout", 0.1),
         mtp=mtp,
+        history=cfg.model.get("history", 0),
     ).to(device)
-    logger.info(f"MTP heads: {mtp}")
+    logger.info(f"MTP heads: {mtp} | history: {cfg.model.get('history', 0)}")
     n_params = sum(p.numel() for p in enc.parameters()) + sum(p.numel() for p in pred.parameters())
     logger.info(f"LeWM params: {n_params/1e6:.1f}M (enc={sum(p.numel() for p in enc.parameters())/1e6:.1f}M)")
 

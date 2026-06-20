@@ -96,7 +96,8 @@ def val(ckpt: str, nf: int = 4, skip: int = 5, train_batches: int = 40,
     pred = LeWMPredictor(latent_dim=enc.hidden_dim, dim=cfg.model.get("pred_dim", 384),
                          depth=cfg.model.get("pred_depth", 6), heads=cfg.model.get("pred_heads", 6),
                          action_dim=2, dropout=cfg.model.get("pred_dropout", 0.1),
-                         mtp=cfg.model.get("mtp_horizon", 1)).to(device)
+                         mtp=cfg.model.get("mtp_horizon", 1),
+                         history=cfg.model.get("history", 0)).to(device)
     enc.load_state_dict(state["encoder"]); pred.load_state_dict(state["predictor"])
     enc.eval(); pred.eval()
     logger.info(f"== VAL {ckpt} (epoch {state.get('epoch')}, mtp={cfg.model.get('mtp_horizon',1)}) ==")

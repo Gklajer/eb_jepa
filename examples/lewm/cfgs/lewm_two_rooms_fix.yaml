@@ -1,0 +1,49 @@
+# LeWM two_rooms — anti-collapse + closer to paper design.
+# Collapse cause: agent invisible (tiny dot drowned in 256 patches after 65->224
+# upscale). Fixes: (1) bigger agent (dot_std 1.3->6), (2) fewer patches
+# (img 112 -> 8x8=64), (3) ViT-S predictor depth 12, (4) history=1 (TwoRoom).
+logging:
+  log_wandb: true
+  wandb_project: lewm
+  wandb_name: lewm_fix
+  log_every: 10
+  tqdm_silent: false
+meta:
+  seed: 1
+data:
+  env_name: two_rooms
+  batch_size: 128
+  num_workers: 8
+  pin_mem: true
+  persistent_workers: false
+  size: 20000
+  val_size: 1000
+  dot_std: 6.0          # bigger agent so the encoder can't ignore it
+  pipeline:
+    mode: online
+training:
+  use_amp: true
+  dtype: bfloat16
+model:
+  in_channels: 2
+  img_size: 112         # patch 14 -> 8x8 = 64 patches (vs 256): agent more prominent
+  patch: 14
+  enc_dim: 192
+  enc_depth: 12
+  enc_heads: 3
+  pred_dim: 384         # ViT-S
+  pred_depth: 12        # ViT-S depth (was 6)
+  pred_heads: 6
+  pred_dropout: 0.1
+  num_frames: 4         # paper: 4 frames
+  frame_skip: 5
+  history: 1            # TwoRoom: history length 1
+  mtp_horizon: 1        # this run; sweep 2/3/4 after validation
+optim:
+  epochs: 10
+  lr: 3.e-4
+  weight_decay: 1.e-4
+  warmup_ratio: 0.05
+  grad_clip: 1.0
+  sigreg_lambda: 0.1
+  sigreg_proj: 1024

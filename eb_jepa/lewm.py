@@ -155,9 +155,10 @@ class LeWMPredictor(nn.Module):
     from the history of state latents z_{≤t} conditioned on action a_t."""
 
     def __init__(self, latent_dim=192, dim=384, depth=6, heads=6,
-                 action_dim=2, max_len=64, dropout=0.1, mtp=1):
+                 action_dim=2, max_len=64, dropout=0.1, mtp=1, history=0):
         super().__init__()
         self.mtp = mtp
+        self.history = history  # 0 = full causal context; k>0 = attend only last k
         self.in_proj = nn.Linear(latent_dim, dim)
         self.act_proj = nn.Linear(action_dim, dim)
         self.pos = nn.Parameter(torch.randn(1, max_len, dim) * 0.02)
@@ -179,6 +180,9 @@ class LeWMPredictor(nn.Module):
         x = self.in_proj(states) + self.pos[:, :L]
         cond = self.act_proj(actions)
         mask = torch.triu(torch.ones(L, L, device=states.device, dtype=torch.bool), 1)
+        if self.history > 0:  # also forbid attending further back than `history`
+            mask = mask | torch.tril(
+                torch.ones(L, L, device=states.device, dtype=torch.bool), -self.history)
         for blk in self.blocks:
             x = blk(x, cond, mask)
         return x, B, L
