@@ -20,7 +20,9 @@ data:
   # --- simplified maze geometry ---
   maze_height: 13      # was 21
   maze_width: 13       # was 21
-  cell_size: 3         # img_size = 13*3 = 39
+  cell_size: 3
+  img_size: 39         # = maze_height * cell_size (set explicitly: agent render
+                       # uses config.img_size and is NOT auto-recomputed)
   sample_length: 13    # shorter training window
   min_path_length: 14  # must be >= sample_length + 1
   pipeline:
