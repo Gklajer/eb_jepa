@@ -68,6 +68,11 @@ JEPA for world modeling + planning in Two Rooms environment.
 | <img src="examples/ac_video_jepa/assets/top_randw_agent_steps_succ.gif" alt="Successful planning episode" width="155" /> | <img src="examples/ac_video_jepa/assets/top_randw_state.png" alt="Episode task definition" width="300" /> |
 | *Successful planning episode* | *From init to goal state* |
 
+### [LeWorldModel / LeWM](examples/lewm/README.md)
+
+End-to-end pixel JEPA world model with SIGReg, MTP heads, latent rollout
+validation, visualization, and self-speculative multi-token rollout benchmarks.
+
 ---
 
 ## 🚀 Installation
