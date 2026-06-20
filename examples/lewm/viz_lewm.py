@@ -1,9 +1,10 @@
-"""Visualize a trained LeWM checkpoint: 3-step latent rollout decoded to pixels.
+"""Visualize a trained LeWM checkpoint: latent rollout decoded to pixels.
 
 LeWM predicts in latent space; two_rooms has no pixel decoder, so we fit a small
 MLPXYHead probe (latent->XY) on frozen LeWM features, then render XY->frames with
-env.coord_to_pixel. Produces the GT | Dec-GT | GT-Act | Rand-Act comparison GIF
-via vis_utils.create_comparison_gif (same format as the impala/vjepa2ac viz).
+env.coord_to_pixel. MTP checkpoints can use self-speculative latent rollout:
+multi-token heads draft, the horizon-1 head verifies, accepted draft prefixes
+are kept, and mismatches regenerate from the verifier token.
 
     cd /lustre/work/vivatech-yentlteam/gklajer/eb_jepa
     PYTHONPATH=$PWD python -m examples.lewm.viz_lewm \
@@ -51,7 +52,9 @@ def decode(z, probe, env, normalizer, wall_x, door_y):
 
 def viz(ckpt: str, fname: str = None, out_dir: str = None,
         nf: int = 4, skip: int = 5, probe_iters: int = 1500,
-        cache_batches: int = 40, seed: int = 0):
+        cache_batches: int = 40, seed: int = 0,
+        speculative: bool = True, speculative_threshold: float = 0.05,
+        speculative_metric: str = "normalized_mse", max_draft_steps: int = None):
     setup_seed(seed)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     ckpt = Path(ckpt)
@@ -69,6 +72,7 @@ def viz(ckpt: str, fname: str = None, out_dir: str = None,
         latent_dim=enc.hidden_dim, dim=cfg.model.get("pred_dim", 384),
         depth=cfg.model.get("pred_depth", 6), heads=cfg.model.get("pred_heads", 6),
         action_dim=2, dropout=cfg.model.get("pred_dropout", 0.1),
+        mtp=cfg.model.get("mtp_horizon", 1),
     ).to(device)
     enc.load_state_dict(state["encoder"]); pred.load_state_dict(state["predictor"])
     enc.eval(); pred.eval()
@@ -115,9 +119,26 @@ def viz(ckpt: str, fname: str = None, out_dir: str = None,
     with torch.no_grad(), autocast("cuda", dtype=torch.bfloat16):
         z = enc(frames).float()                          # [B, nf, D]
     n = nf - 1
-    pred_true = pred.rollout(z[:, :1], blocks, n)         # [B, n, D]
+    if speculative and pred.mtp > 1:
+        pred_true = pred.self_speculative_rollout(
+            z[:, :1], blocks, n, threshold=speculative_threshold,
+            distance_metric=speculative_metric, max_draft_steps=max_draft_steps,
+        )                                                 # [B, n, D]
+        true_spec_stats = dict(pred.last_speculative_stats)
+        logger.info(f"self-spec true actions: {true_spec_stats}")
+    else:
+        if speculative and pred.mtp <= 1:
+            logger.warning("speculative=True ignored because checkpoint has mtp_horizon<=1")
+        pred_true = pred.rollout(z[:, :1], blocks, n)     # [B, n, D]
     rand_blocks = torch.randn_like(blocks)
-    pred_rand = pred.rollout(z[:, :1], rand_blocks, n)
+    if speculative and pred.mtp > 1:
+        pred_rand = pred.self_speculative_rollout(
+            z[:, :1], rand_blocks, n, threshold=speculative_threshold,
+            distance_metric=speculative_metric, max_draft_steps=max_draft_steps,
+        )
+        logger.info(f"self-spec random actions: {pred.last_speculative_stats}")
+    else:
+        pred_rand = pred.rollout(z[:, :1], rand_blocks, n)
 
     # latent MSE curve
     mse_t = ((pred_true - z[:, 1:]) ** 2).mean(dim=(0, 2)).cpu().numpy()

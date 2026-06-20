@@ -33,6 +33,7 @@ model:
   pred_dropout: 0.1
   num_frames: 4        # sub-trajectory length
   frame_skip: 5        # frame-skip / action-block size
+  mtp_horizon: 3       # multi-token heads for self-speculative latent rollout
 optim:
   epochs: 10
   lr: 3.e-4
