@@ -55,6 +55,18 @@ For MTP, the prediction loss averages valid `(time, horizon)` pairs.
 
 Self-speculative rollout is implemented in `LeWMPredictor.self_speculative_rollout`.
 
+### Approach overview
+
+The GIF below compares the autoregressive baseline with our self-speculative
+multi-token rollout. The autoregressive baseline advances one latent step per
+predictor call. Our method drafts several future latents with the MTP heads,
+verifies them with the horizon-1 head in latent space, keeps the accepted prefix,
+and regenerates only after the first mismatch.
+
+<p align="center">
+  <img src="../../comparison_planning_arbase.gif" alt="Autoregressive baseline versus self-speculative multi-token latent planning" width="760">
+</p>
+
 At each chunk:
 
 1. The MTP heads draft up to `mtp_horizon` future latent tokens.
