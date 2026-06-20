@@ -120,6 +120,30 @@ def modulate(x, shift, scale):
     return x * (1 + scale.unsqueeze(1)) + shift.unsqueeze(1)
 
 
+def lewm_latent_step_distance(draft, verifier, metric="normalized_mse"):
+    """Distance between drafted and verified latent tokens, returned as [B, T]."""
+    if draft.shape != verifier.shape:
+        raise ValueError(
+            "Draft and verifier latent shapes must match: "
+            f"{tuple(draft.shape)} != {tuple(verifier.shape)}"
+        )
+    if metric == "mse":
+        return (draft - verifier).pow(2).mean(dim=-1)
+    if metric == "normalized_mse":
+        mse = (draft - verifier).pow(2).mean(dim=-1)
+        denom = verifier.pow(2).mean(dim=-1).clamp_min(1e-6)
+        return mse / denom
+    if metric == "cosine":
+        return 1.0 - F.cosine_similarity(draft, verifier, dim=-1)
+    raise ValueError(f"Unknown speculative latent distance metric: {metric}")
+
+
+def accepted_prefix_lengths(distances, threshold):
+    """Count accepted draft steps before the first verifier mismatch."""
+    accepted = (distances <= threshold).to(torch.int64)
+    return accepted.cumprod(dim=1).sum(dim=1)
+
+
 class AdaLNBlock(nn.Module):
     """DiT-style block: self-attention + MLP, both modulated by the action via
     AdaLN-Zero. The final modulation projection is zero-init so the block starts
@@ -174,11 +198,21 @@ class LeWMPredictor(nn.Module):
         else:
             self.heads = nn.ModuleList([nn.Linear(dim, latent_dim) for _ in range(mtp)])
             self.bns = nn.ModuleList([nn.BatchNorm1d(latent_dim) for _ in range(mtp)])
+            self.horizon_act_proj = nn.ModuleList(
+                [nn.Linear(action_dim * (k + 1), dim) for k in range(mtp)]
+            )
+            for proj in self.horizon_act_proj:
+                nn.init.zeros_(proj.weight)
+                nn.init.zeros_(proj.bias)
 
     def _trunk(self, states, actions):
         B, L, _ = states.shape
+        if actions.size(1) < L:
+            raise ValueError(
+                f"Need at least {L} actions for {L} states, got {actions.size(1)}"
+            )
         x = self.in_proj(states) + self.pos[:, :L]
-        cond = self.act_proj(actions)
+        cond = self.act_proj(actions[:, :L])
         mask = torch.triu(torch.ones(L, L, device=states.device, dtype=torch.bool), 1)
         if self.history > 0:  # also forbid attending further back than `history`
             mask = mask | torch.tril(
@@ -187,31 +221,191 @@ class LeWMPredictor(nn.Module):
             x = blk(x, cond, mask)
         return x, B, L
 
+    def _future_action_window(self, actions, state_len, horizon):
+        """Return flattened action windows [a_t, ..., a_{t+h}] for each state t."""
+        pieces = []
+        for offset in range(horizon + 1):
+            idx = torch.arange(state_len, device=actions.device) + offset
+            idx = idx.clamp(max=actions.size(1) - 1)
+            pieces.append(actions.index_select(1, idx))
+        return torch.cat(pieces, dim=-1)
+
     def forward(self, states, actions):
-        # states: [B,L,latent], actions: [B,L,A]
+        # states: [B,L,latent], actions: [B,>=L,A]
         # -> [B,L,latent] (mtp==1) or [B,L,K,latent] (mtp>1)
         x, B, L = self._trunk(states, actions)
         if self.mtp == 1:
             out = self.bn(self.out(x).reshape(B * L, -1)).reshape(B, L, -1)
             return out
-        outs = [self.bns[k](self.heads[k](x).reshape(B * L, -1)).reshape(B, L, -1)
-                for k in range(self.mtp)]
+        outs = []
+        for k in range(self.mtp):
+            act_window = self._future_action_window(actions, L, k)
+            x_k = x + self.horizon_act_proj[k](act_window)
+            out_k = self.bns[k](self.heads[k](x_k).reshape(B * L, -1))
+            outs.append(out_k.reshape(B, L, -1))
         return torch.stack(outs, dim=2)  # [B, L, K, latent]
+
+    def _one_step(self, states, actions):
+        x, B, L = self._trunk(states, actions)
+        if self.mtp == 1:
+            return self.bn(self.out(x).reshape(B * L, -1)).reshape(B, L, -1)
+        act_window = self._future_action_window(actions, L, 0)
+        x0 = x + self.horizon_act_proj[0](act_window)
+        return self.bns[0](self.heads[0](x0).reshape(B * L, -1)).reshape(B, L, -1)
 
     @torch.no_grad()
     def rollout(self, first_state, actions, nsteps):
         """Autoregressive 1-step rollout (uses head k=0 if MTP). first_state
         [B,1,D], actions [B,>=nsteps,A]."""
+        if nsteps == 0:
+            return first_state[:, :0]
         seq = first_state
         preds = []
         for i in range(nsteps):
-            out = self.forward(seq, actions[:, : seq.size(1)])
-            if self.mtp > 1:
-                out = out[:, :, 0]               # k=0 (next-step) head -> [B,L,D]
+            out = self._one_step(seq, actions[:, : seq.size(1)])
             nxt = out[:, -1:, :]
             preds.append(nxt)
             seq = torch.cat([seq, nxt], dim=1)
         return torch.cat(preds, dim=1)
+
+    def _verify_draft(self, seq, draft, actions):
+        """Verify a latent draft with the horizon-1 head on the drafted prefix."""
+        chunk = draft.size(1)
+        if chunk < 1:
+            raise ValueError("draft must contain at least one token")
+
+        # Position L-1 predicts draft[0], position L predicts draft[1], etc.
+        verify_states = seq if chunk == 1 else torch.cat([seq, draft[:, :-1]], dim=1)
+        verify_actions = actions[:, : verify_states.size(1)]
+        verifier = self._one_step(verify_states, verify_actions)
+        start = seq.size(1) - 1
+        return verifier[:, start: start + chunk]
+
+    @torch.no_grad()
+    def self_speculative_rollout(
+        self,
+        first_state,
+        actions,
+        nsteps,
+        threshold=0.05,
+        distance_metric="normalized_mse",
+        max_draft_steps=None,
+    ):
+        """Self-speculative rollout in LeWM latent space.
+
+        MTP heads draft several future latent tokens from the current prefix. The
+        same predictor's horizon-1 head then verifies those tokens on the drafted
+        prefix. The accepted prefix is kept; after the first mismatch the
+        verifier token is used and the remaining future is regenerated.
+        """
+        if nsteps < 0:
+            raise ValueError(f"nsteps must be non-negative, got {nsteps}")
+        if first_state.dim() != 3:
+            raise ValueError(
+                f"first_state must be [B,L,D], got {tuple(first_state.shape)}"
+            )
+        if actions.dim() != 3:
+            raise ValueError(f"actions must be [B,T,A], got {tuple(actions.shape)}")
+        if first_state.size(0) != actions.size(0):
+            raise ValueError(
+                "first_state and actions batch sizes must match: "
+                f"{first_state.size(0)} != {actions.size(0)}"
+            )
+        if nsteps == 0:
+            self.last_speculative_stats = {
+                "enabled": self.mtp > 1,
+                "chunks": 0,
+                "steps": 0,
+                "threshold": float(threshold),
+                "distance_metric": distance_metric,
+            }
+            return first_state[:, :0]
+
+        needed_actions = first_state.size(1) + nsteps - 1
+        if actions.size(1) < needed_actions:
+            raise ValueError(
+                f"Need at least {needed_actions} action tokens for {nsteps} steps "
+                f"from a context of length {first_state.size(1)}, got {actions.size(1)}"
+            )
+
+        if self.mtp <= 1:
+            out = self.rollout(first_state, actions, nsteps)
+            self.last_speculative_stats = {
+                "enabled": False,
+                "reason": "mtp<=1",
+                "chunks": nsteps,
+                "steps": nsteps,
+                "threshold": float(threshold),
+                "distance_metric": distance_metric,
+            }
+            return out
+
+        if max_draft_steps is None:
+            draft_window = self.mtp
+        else:
+            draft_window = min(int(max_draft_steps), self.mtp)
+            if draft_window < 1:
+                raise ValueError(f"max_draft_steps must be >= 1, got {max_draft_steps}")
+
+        seq = first_state
+        steps_done = 0
+        chunks = 0
+        used_draft_tokens = 0.0
+        selected_tokens = 0.0
+        accepted_counts = []
+        distance_means = []
+
+        while steps_done < nsteps:
+            chunk = min(draft_window, nsteps - steps_done)
+
+            draft_len = seq.size(1) + chunk - 1
+            draft_out = self.forward(seq, actions[:, :draft_len])
+            draft = draft_out[:, -1, :chunk]       # [B, chunk, D]
+            verifier = self._verify_draft(seq, draft, actions)
+            distances = lewm_latent_step_distance(
+                draft, verifier, metric=distance_metric
+            )
+            accepted_prefix = accepted_prefix_lengths(distances, threshold)
+            advance_per_item = torch.clamp(accepted_prefix + 1, max=chunk)
+            advance = max(1, int(advance_per_item.min().item()))
+
+            accepted_counts.append(accepted_prefix.float().mean().detach())
+            distance_means.append(distances.mean().detach())
+            chunks += 1
+
+            for local_step in range(advance):
+                use_draft = (local_step < accepted_prefix).view(-1, 1)
+                next_state = torch.where(
+                    use_draft,
+                    draft[:, local_step],
+                    verifier[:, local_step],
+                ).unsqueeze(1)
+                used_draft_tokens += float(use_draft.sum().item())
+                selected_tokens += float(use_draft.numel())
+                seq = torch.cat([seq, next_state], dim=1)
+
+            steps_done += advance
+
+        mean_accepted_prefix = (
+            torch.stack(accepted_counts).mean().item() if accepted_counts else 0.0
+        )
+        mean_verify_distance = (
+            torch.stack(distance_means).mean().item() if distance_means else 0.0
+        )
+        self.last_speculative_stats = {
+            "enabled": True,
+            "chunks": chunks,
+            "steps": int(nsteps),
+            "draft_window": int(draft_window),
+            "threshold": float(threshold),
+            "distance_metric": distance_metric,
+            "mean_accepted_prefix": mean_accepted_prefix,
+            "mean_verify_distance": mean_verify_distance,
+            "accepted_token_rate": used_draft_tokens / max(selected_tokens, 1.0),
+            "effective_steps_per_chunk": float(nsteps) / max(chunks, 1),
+        }
+        start = first_state.size(1)
+        return seq[:, start: start + nsteps]
 
 
 # ---------------------------------------------------------------------------
