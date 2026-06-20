@@ -14,6 +14,7 @@ from torch.optim import AdamW
 from tqdm import tqdm
 
 from eb_jepa.architectures import (
+    CausalMultiHorizonPredictor,
     ImpalaEncoder,
     InverseDynamicsModel,
     Projector,
@@ -22,7 +23,7 @@ from eb_jepa.architectures import (
 from eb_jepa.datasets.utils import init_data
 from eb_jepa.jepa import JEPA, JEPAProbe
 from eb_jepa.logging import get_logger
-from eb_jepa.losses import SquareLossSeq, VC_IDM_Sim_Regularizer
+from eb_jepa.losses import MultiHorizonLoss, SquareLossSeq, VC_IDM_Sim_Regularizer
 from eb_jepa.schedulers import CosineWithWarmup
 from eb_jepa.state_decoder import MLPXYHead
 from eb_jepa.training_utils import (
@@ -184,9 +185,28 @@ def run(
     )
     test_output = encoder(test_input)
     _, f, _, h, w = test_output.shape
-    predictor = RNNPredictor(
-        hidden_size=encoder.mlp_output_dim, final_ln=encoder.final_ln
-    )
+    predictor_type = cfg.model.get("predictor_type", "direct_multi_horizon")
+    if predictor_type == "rnn":
+        predictor = RNNPredictor(
+            hidden_size=encoder.mlp_output_dim, final_ln=encoder.final_ln
+        )
+        unroll_mode = "autoregressive"
+    elif predictor_type in ("direct_multi_horizon", "causal_transformer"):
+        predictor = CausalMultiHorizonPredictor(
+            encoder_dim=encoder.mlp_output_dim,
+            action_dim=2,
+            num_patches=h * w,
+            horizon=cfg.model.nsteps,
+            context_length=cfg.model.get("context_length", 1),
+            pred_dim=cfg.model.get("pred_dim", encoder.mlp_output_dim),
+            depth=cfg.model.get("predictor_depth", 4),
+            num_heads=cfg.model.get("predictor_heads", 8),
+            mlp_ratio=cfg.model.get("predictor_mlp_ratio", 4.0),
+            dropout=cfg.model.get("predictor_dropout", 0.0),
+        )
+        unroll_mode = "direct_multi_horizon"
+    else:
+        raise ValueError(f"Unknown predictor_type: {predictor_type}")
     aencoder = nn.Identity()
     if cfg.model.regularizer.use_proj:
         projector = Projector(
@@ -214,7 +234,13 @@ def run(
         idm_after_proj=cfg.model.regularizer.idm_after_proj,
         sim_t_after_proj=cfg.model.regularizer.sim_t_after_proj,
     )
-    ploss = SquareLossSeq()
+    if unroll_mode == "direct_multi_horizon":
+        ploss = MultiHorizonLoss(
+            gamma=cfg.model.get("horizon_loss_gamma", 0.5),
+            loss_type=cfg.model.get("horizon_loss_type", "smooth_l1"),
+        )
+    else:
+        ploss = SquareLossSeq()
     jepa = JEPA(encoder, aencoder, predictor, regularizer, ploss).to(device)
 
     # Log model structure and parameters
@@ -322,8 +348,8 @@ def run(
                     x,
                     a,
                     nsteps=cfg.model.nsteps,
-                    unroll_mode="autoregressive",
-                    ctxt_window_time=1,
+                    unroll_mode=unroll_mode,
+                    ctxt_window_time=cfg.model.get("context_length", 1),
                     compute_loss=True,
                     return_all_steps=False,
                 )

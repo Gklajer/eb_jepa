@@ -29,7 +29,16 @@ model:
   henc: 32
   hpre: 32
   dstc: 32
-  nsteps: 8
+  nsteps: 5
+  predictor_type: direct_multi_horizon # direct_multi_horizon | rnn
+  context_length: 1
+  pred_dim: 512
+  predictor_depth: 4
+  predictor_heads: 8
+  predictor_mlp_ratio: 4.0
+  predictor_dropout: 0.0
+  horizon_loss_gamma: 0.5
+  horizon_loss_type: smooth_l1 # smooth_l1 | l1 | mse
   encoder_architecture: impala # impala | resnet | conv
   train_rollout: last # last | all
   encoder_skip_connections: True

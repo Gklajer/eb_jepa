@@ -156,6 +156,118 @@ class JEPA(JEPAbase):
                 if compute_loss:
                     ploss += self.predcost(state, predicted_states) / nsteps
 
+        # Direct multi-horizon mode: predict K future states from true latent context
+        # and an action sequence in one forward pass with causal masking inside the predictor.
+        elif unroll_mode == "direct_multi_horizon":
+            if actions_encoded is None:
+                raise ValueError("direct_multi_horizon requires action inputs")
+            if nsteps > actions_encoded.size(2):
+                raise ValueError(
+                    f"nsteps ({nsteps}) larger than action sequence length "
+                    f"({actions_encoded.size(2)})"
+                )
+
+            effective_ctxt_window = getattr(
+                self.predictor, "context_length", ctxt_window_time
+            )
+            max_horizon = getattr(self.predictor, "horizon", nsteps)
+
+            if compute_loss:
+                num_windows = min(
+                    state.size(2) - effective_ctxt_window - nsteps + 1,
+                    actions_encoded.size(2) - effective_ctxt_window - nsteps + 2,
+                )
+                if num_windows <= 0:
+                    raise ValueError(
+                        "Not enough timesteps for direct_multi_horizon training: "
+                        f"T_state={state.size(2)}, T_actions={actions_encoded.size(2)}, "
+                        f"context={effective_ctxt_window}, nsteps={nsteps}"
+                    )
+
+                context_batches = []
+                action_batches = []
+                target_batches = []
+                for start in range(num_windows):
+                    action_start = start + effective_ctxt_window - 1
+                    context_batches.append(
+                        state[:, :, start : start + effective_ctxt_window]
+                    )
+                    action_batches.append(
+                        actions_encoded[:, :, action_start : action_start + nsteps]
+                    )
+                    target_batches.append(
+                        state[
+                            :,
+                            :,
+                            start
+                            + effective_ctxt_window : start
+                            + effective_ctxt_window
+                            + nsteps,
+                        ]
+                    )
+
+                context_states = torch.cat(context_batches, dim=0)
+                context_actions = torch.cat(action_batches, dim=0)
+                target_states = torch.cat(target_batches, dim=0)
+                predicted_future = self.predictor(context_states, context_actions)
+                ploss = self.predcost(target_states, predicted_future)
+
+                # Return the first window in the usual [B, D, T, H, W] style.
+                predicted_states = torch.cat(
+                    [
+                        state[:, :, :effective_ctxt_window],
+                        predicted_future[: state.size(0)],
+                    ],
+                    dim=2,
+                )
+                if return_all_steps:
+                    all_steps.extend(
+                        [
+                            torch.cat(
+                                [
+                                    state[:, :, :effective_ctxt_window],
+                                    predicted_future[: state.size(0), :, : h + 1],
+                                ],
+                                dim=2,
+                            )
+                            for h in range(predicted_future.size(2))
+                        ]
+                    )
+            else:
+                if state.size(2) < effective_ctxt_window:
+                    pad_count = effective_ctxt_window - state.size(2)
+                    pad = state[:, :, :1].expand(-1, -1, pad_count, -1, -1)
+                    context_states = torch.cat([pad, state], dim=2)
+                else:
+                    context_states = state[:, :, -effective_ctxt_window:]
+
+                predicted_states = context_states
+                steps_done = 0
+                while steps_done < nsteps:
+                    chunk = min(max_horizon, nsteps - steps_done)
+                    context_states = predicted_states[:, :, -effective_ctxt_window:]
+                    context_actions = actions_encoded[
+                        :, :, steps_done : steps_done + chunk
+                    ]
+                    predicted_future = self.predictor(context_states, context_actions)
+                    predicted_states = torch.cat(
+                        [predicted_states, predicted_future], dim=2
+                    )
+                    if return_all_steps:
+                        all_steps.extend(
+                            [
+                                torch.cat(
+                                    [
+                                        predicted_states[:, :, : -chunk],
+                                        predicted_future[:, :, : h + 1],
+                                    ],
+                                    dim=2,
+                                )
+                                for h in range(chunk)
+                            ]
+                        )
+                    steps_done += chunk
+
         # Autoregressive mode: step-by-step with sliding window
         # Note: RNN predictors (is_rnn=True) are a special case with ctxt_window_time=1
         elif unroll_mode == "autoregressive":

@@ -1,0 +1,668 @@
+\documentclass[11pt,a4paper]{article}
+
+\usepackage[utf8]{inputenc}
+\usepackage[T1]{fontenc}
+\usepackage{lmodern}
+\usepackage[french]{babel}
+\usepackage{geometry}
+\usepackage{xcolor}
+\usepackage{hyperref}
+\usepackage{fancyhdr}
+\usepackage{titlesec}
+\usepackage{enumitem}
+\usepackage{booktabs}
+\usepackage{longtable}
+\usepackage{array}
+\usepackage{amsmath}
+\usepackage{amssymb}
+\usepackage{graphicx}
+\usepackage{listings}
+\usepackage{lastpage}
+
+\geometry{margin=2.2cm}
+
+\definecolor{accent}{HTML}{1F5F5B}
+\definecolor{accentlight}{HTML}{E8F3F1}
+\definecolor{codebg}{HTML}{F6F8FA}
+\definecolor{codetext}{HTML}{24292F}
+\definecolor{softgray}{HTML}{6B7280}
+\definecolor{danger}{HTML}{8A1F11}
+
+\hypersetup{
+  colorlinks=true,
+  linkcolor=accent,
+  urlcolor=accent,
+  citecolor=accent,
+  pdftitle={Rapport de modification AC Video JEPA},
+  pdfauthor={Codex}
+}
+
+\pagestyle{fancy}
+\fancyhf{}
+\lhead{\textcolor{softgray}{AC Video JEPA}}
+\rhead{\textcolor{softgray}{Rapport technique}}
+\cfoot{\textcolor{softgray}{Page \thepage\ sur \pageref{LastPage}}}
+\renewcommand{\headrulewidth}{0.2pt}
+\renewcommand{\footrulewidth}{0.2pt}
+
+\titleformat{\section}
+  {\Large\bfseries\color{accent}}
+  {\thesection}{0.8em}{}
+\titleformat{\subsection}
+  {\large\bfseries\color{accent}}
+  {\thesubsection}{0.8em}{}
+
+\setlist[itemize]{leftmargin=1.2em, itemsep=0.25em}
+\setlist[enumerate]{leftmargin=1.5em, itemsep=0.25em}
+
+\lstdefinestyle{code}{
+  backgroundcolor=\color{codebg},
+  basicstyle=\ttfamily\small\color{codetext},
+  breaklines=true,
+  columns=fullflexible,
+  keepspaces=true,
+  frame=single,
+  framerule=0pt,
+  rulecolor=\color{codebg},
+  xleftmargin=0.4em,
+  xrightmargin=0.4em,
+  aboveskip=0.7em,
+  belowskip=0.7em
+}
+\lstset{style=code}
+
+\newcommand{\filepath}[1]{\texttt{#1}}
+\newcommand{\code}[1]{\texttt{#1}}
+
+\newcommand{\infobox}[2]{
+  \vspace{0.8em}
+  \noindent
+  \fcolorbox{accent}{accentlight}{
+    \begin{minipage}{0.94\linewidth}
+      \vspace{0.5em}
+      \textbf{\color{accent}#1}\par\vspace{0.3em}
+      #2
+      \vspace{0.5em}
+    \end{minipage}
+  }
+  \vspace{0.8em}
+}
+
+\begin{document}
+
+\begin{titlepage}
+  \centering
+  \vspace*{2.0cm}
+  {\Huge\bfseries\color{accent}Rapport technique\par}
+  \vspace{0.4cm}
+  {\LARGE Adaptation de V-JEPA-AC vers un prédicteur direct multi-horizon causal\par}
+  \vspace{1.0cm}
+  {\large Projet : \texttt{V-JEPA-AC-paral}\par}
+  \vspace{0.2cm}
+  {\large Date du rapport : \today\par}
+  \vfill
+  \infobox{Résumé}{
+    Ce rapport décrit les modifications apportées au modèle \code{ac\_video\_jepa}.
+    L'objectif est de remplacer le rollout autoregressif mono-step par une prédiction
+    directe multi-horizon, calculée en un seul forward pass, tout en garantissant une
+    causalité stricte sur la séquence d'actions.
+  }
+  \vfill
+  {\small Généré dans le dossier \texttt{rapport/}.}
+\end{titlepage}
+
+\tableofcontents
+\newpage
+
+\section{Contexte et objectif}
+
+Le code initial de l'exemple \filepath{examples/ac\_video\_jepa} utilisait un prédicteur
+autoregressif de type GRU. Le fonctionnement était le suivant :
+
+\[
+z_t, a_t \rightarrow \hat z_{t+1}
+\]
+
+puis :
+
+\[
+\hat z_{t+1}, a_{t+1} \rightarrow \hat z_{t+2}
+\]
+
+et ainsi de suite. Ce choix est simple, mais il introduit une accumulation d'erreur :
+une erreur sur \(\hat z_{t+1}\) devient l'état d'entrée de la prédiction suivante.
+
+\subsection{Nouvel objectif}
+
+L'objectif demandé était de transformer le modèle vers une formulation directe
+multi-horizon :
+
+\[
+G(z_t, s_t, a_t, \dots, a_{t+K-1})
+\rightarrow
+(\hat z_{t+1}, \dots, \hat z_{t+K})
+\]
+
+avec \(K=5\) dans la configuration par défaut.
+
+La dépendance voulue est :
+
+\begin{center}
+\begin{tabular}{ll}
+\toprule
+Sortie & Dépendances autorisées \\
+\midrule
+\(\hat z_{t+1}\) & \(z_t, s_t, a_t\) \\
+\(\hat z_{t+2}\) & \(z_t, s_t, a_t, a_{t+1}\) \\
+\(\hat z_{t+3}\) & \(z_t, s_t, a_t, a_{t+1}, a_{t+2}\) \\
+\(\hat z_{t+4}\) & \(z_t, s_t, a_t, a_{t+1}, a_{t+2}, a_{t+3}\) \\
+\(\hat z_{t+5}\) & \(z_t, s_t, a_t, a_{t+1}, a_{t+2}, a_{t+3}, a_{t+4}\) \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+Le point essentiel est que toutes les sorties sont produites en un seul forward pass,
+mais chaque horizon ne voit que le préfixe d'actions qui lui correspond.
+
+\section{Vue d'ensemble des modifications}
+
+Huit fichiers ont été modifiés.
+
+\begin{center}
+\begin{tabular}{>{\small\raggedright\arraybackslash}p{0.54\linewidth}p{0.34\linewidth}}
+\toprule
+Fichier & Rôle de la modification \\
+\midrule
+\filepath{eb\_jepa/architectures.py} & Ajout du masque causal et du nouveau prédicteur Transformer multi-horizon. \\
+\filepath{eb\_jepa/jepa.py} & Ajout du mode \code{direct\_multi\_horizon} dans \code{JEPA.unroll}. \\
+\filepath{eb\_jepa/losses.py} & Ajout de la loss pondérée \code{MultiHorizonLoss}. \\
+\filepath{eb\_jepa/planning.py} & Adaptation du planner pour utiliser automatiquement le nouveau mode et ajout de régularisations d'actions. \\
+\filepath{examples/ac\_video\_jepa/main.py} & Branchement du nouveau prédicteur dans l'entraînement AC Video JEPA. \\
+\filepath{examples/ac\_video\_jepa/cfgs/train.yaml} & Configuration par défaut vers \(K=5\) et prédicteur multi-horizon. \\
+\filepath{examples/ac\_video\_jepa/cfgs/planning\_mppi.yaml} & MPC aligné sur horizon 5, coût terminal, régularisation des actions. \\
+\filepath{tests/test\_jepa\_output\_formats.py} & Ajout de tests de masque causal et de sortie multi-horizon. \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\section{Nouveau prédicteur causal multi-horizon}
+
+\subsection{Fichier modifié}
+
+\filepath{eb\_jepa/architectures.py}
+
+\subsection{Masque causal}
+
+Une fonction a été ajoutée :
+
+\begin{lstlisting}[language=Python]
+build_multi_horizon_mask(
+    num_context_tokens,
+    num_patches,
+    horizon,
+    device,
+)
+\end{lstlisting}
+
+Elle construit un masque d'attention booléen. Dans cette convention, \code{True}
+signifie que l'attention est bloquée.
+
+L'ordre des tokens est :
+
+\[
+[\text{tokens contexte latent}]
++
+[\text{tokens actions}]
++
+[\text{tokens queries futures}]
+\]
+
+Le masque impose trois règles.
+
+\begin{enumerate}
+  \item Les tokens de contexte latent ne voient que le contexte latent.
+  \item Le token d'action \(a_h\) voit le contexte et le préfixe \(a_0,\dots,a_h\).
+  \item La query \(q_h\), qui prédit \(\hat z_{t+h+1}\), voit le contexte et \(a_0,\dots,a_h\), mais pas les actions futures.
+\end{enumerate}
+
+\infobox{Pourquoi ce masque est nécessaire}{
+  Il ne suffit pas de bloquer directement l'accès de \(q_1\) à \(a_4\). Il faut aussi
+  empêcher les tokens intermédiaires de transporter indirectement l'information de
+  \(a_4\). C'est pour cela que les tokens d'action eux-mêmes sont causaux.
+}
+
+\subsection{Classe \code{CausalMultiHorizonPredictor}}
+
+Une nouvelle classe a été ajoutée :
+
+\begin{lstlisting}[language=Python]
+class CausalMultiHorizonPredictor(nn.Module):
+    ...
+\end{lstlisting}
+
+Son interface est :
+
+\begin{lstlisting}[language=Python]
+state:  [B, D, context, H, W]
+action: [B, A, K]
+return: [B, D, K, H, W]
+\end{lstlisting}
+
+Dans le cas actuel de l'encodeur Impala, la représentation est globale :
+
+\[
+z_t \in \mathbb{R}^{512 \times 1 \times 1}
+\]
+
+Donc le prédicteur travaille principalement avec :
+
+\[
+[B, 512, context, 1, 1] + [B, 2, K]
+\rightarrow
+[B, 512, K, 1, 1]
+\]
+
+Mais l'implémentation supporte aussi plusieurs patches latents si un futur encodeur
+produit une carte spatiale \(H \times W\).
+
+\section{Nouveau mode dans \code{JEPA.unroll}}
+
+\subsection{Fichier modifié}
+
+\filepath{eb\_jepa/jepa.py}
+
+\subsection{Mode ajouté}
+
+Un nouveau mode a été ajouté :
+
+\begin{lstlisting}[language=Python]
+unroll_mode="direct_multi_horizon"
+\end{lstlisting}
+
+Ce mode conserve les anciens modes :
+
+\begin{itemize}
+  \item \code{parallel}, utilisé par l'exemple Video JEPA non actionné ;
+  \item \code{autoregressive}, utilisé par l'ancien AC Video JEPA GRU ;
+  \item \code{direct\_multi\_horizon}, ajouté pour le nouvel objectif.
+\end{itemize}
+
+\subsection{Comportement en entraînement}
+
+Pendant l'entraînement, le code encode d'abord toute la séquence :
+
+\[
+z_{0:T} = E(x_{0:T})
+\]
+
+Puis il crée des fenêtres glissantes :
+
+\[
+z_{t-c+1:t},\quad a_t,\dots,a_{t+K-1}
+\rightarrow
+z_{t+1},\dots,z_{t+K}
+\]
+
+où \(c\) est \code{context\_length}.
+
+Avec la configuration actuelle :
+
+\[
+c = 1,\quad K = 5
+\]
+
+ce qui donne :
+
+\[
+z_t,\quad a_t,\dots,a_{t+4}
+\rightarrow
+z_{t+1},\dots,z_{t+5}
+\]
+
+L'intérêt est que chaque horizon est appris directement depuis le vrai latent courant,
+et non depuis une prédiction précédente.
+
+\subsection{Comportement en planning}
+
+En planning, le mode reçoit :
+
+\[
+z_t,\quad a_t,\dots,a_{t+K-1}
+\]
+
+et produit :
+
+\[
+\hat z_{t+1:t+K}
+\]
+
+Si le planner demande un horizon plus long que celui du prédicteur, le code découpe
+en blocs. Pour la configuration par défaut, le planning utilise exactement \(K=5\).
+
+\section{Nouvelle loss multi-horizon}
+
+\subsection{Fichier modifié}
+
+\filepath{eb\_jepa/losses.py}
+
+\subsection{Classe ajoutée}
+
+\begin{lstlisting}[language=Python]
+class MultiHorizonLoss(nn.Module):
+    ...
+\end{lstlisting}
+
+Elle reçoit :
+
+\begin{lstlisting}[language=Python]
+pred:   [B, D, K, H, W]
+target: [B, D, K, H, W]
+\end{lstlisting}
+
+Elle applique une loss par horizon, puis pondère les horizons avec des poids croissants
+vers le terminal.
+
+Par défaut :
+
+\[
+\gamma = 0.5
+\]
+
+Pour \(K=5\), les poids sont équivalents à :
+
+\[
+[0.0625,\;0.125,\;0.25,\;0.5,\;1.0]
+\]
+
+\subsection{Raison du choix}
+
+Le terminal est le plus important pour le MPC, car le coût principal compare souvent
+\(\hat z_{t+K}\) au but. Les horizons intermédiaires restent utiles comme supervision
+auxiliaire : ils forcent le modèle à apprendre une trajectoire latente plausible et pas
+seulement une association directe entre une séquence d'actions et un état final.
+
+\section{Branchement dans AC Video JEPA}
+
+\subsection{Fichier modifié}
+
+\filepath{examples/ac\_video\_jepa/main.py}
+
+\subsection{Nouveau choix de prédicteur}
+
+Le script d'entraînement lit maintenant :
+
+\begin{lstlisting}[language=Python]
+predictor_type = cfg.model.get("predictor_type", "direct_multi_horizon")
+\end{lstlisting}
+
+Deux chemins existent :
+
+\begin{itemize}
+  \item \code{predictor\_type: rnn} conserve l'ancien \code{RNNPredictor}.
+  \item \code{predictor\_type: direct\_multi\_horizon} active le nouveau prédicteur.
+\end{itemize}
+
+Cela permet de comparer l'ancien modèle et le nouveau sans supprimer le comportement
+précédent.
+
+\subsection{Loss utilisée}
+
+Si le nouveau mode est actif, le training utilise :
+
+\begin{lstlisting}[language=Python]
+MultiHorizonLoss(...)
+\end{lstlisting}
+
+Sinon, il conserve :
+
+\begin{lstlisting}[language=Python]
+SquareLossSeq()
+\end{lstlisting}
+
+\section{Modifications de configuration}
+
+\subsection{Training}
+
+Fichier :
+
+\filepath{examples/ac\_video\_jepa/cfgs/train.yaml}
+
+Les changements principaux sont :
+
+\begin{lstlisting}
+nsteps: 5
+predictor_type: direct_multi_horizon
+context_length: 1
+pred_dim: 512
+predictor_depth: 4
+predictor_heads: 8
+horizon_loss_gamma: 0.5
+horizon_loss_type: smooth_l1
+\end{lstlisting}
+
+La valeur \(K=5\) correspond directement à la formulation discutée.
+
+\subsection{Planning MPPI}
+
+Fichier :
+
+\filepath{examples/ac\_video\_jepa/cfgs/planning\_mppi.yaml}
+
+Les changements principaux sont :
+
+\begin{lstlisting}
+plan_length: 5
+sum_all_diffs: false
+action_l2_coeff: 0.01
+action_smoothness_coeff: 0.05
+\end{lstlisting}
+
+Le coût MPC devient principalement terminal :
+
+\[
+J = d(\hat z_{t+5}, z_{\text{goal}})
+\]
+
+avec régularisation légère des actions.
+
+\section{Adaptation du planner}
+
+\subsection{Fichier modifié}
+
+\filepath{eb\_jepa/planning.py}
+
+\subsection{Détection automatique du nouveau prédicteur}
+
+Le planner détecte :
+
+\begin{lstlisting}[language=Python]
+predictor.direct_multi_horizon
+\end{lstlisting}
+
+Si ce flag existe, il appelle :
+
+\begin{lstlisting}[language=Python]
+unroll_mode="direct_multi_horizon"
+\end{lstlisting}
+
+Sinon, il conserve l'ancien mode :
+
+\begin{lstlisting}[language=Python]
+unroll_mode="autoregressive"
+\end{lstlisting}
+
+\subsection{Régularisation des actions}
+
+Deux coefficients optionnels ont été ajoutés :
+
+\begin{lstlisting}[language=Python]
+action_l2_coeff
+action_smoothness_coeff
+\end{lstlisting}
+
+Le coût devient :
+
+\[
+J =
+d(\hat z_{t+K}, z_g)
++
+\lambda \frac{1}{K}\sum_i \|a_i\|^2
++
+\mu \frac{1}{K-1}\sum_i \|a_i-a_{i-1}\|^2
+\]
+
+Cela stabilise le planning et évite des séquences d'actions inutilement violentes.
+
+\section{Tests ajoutés}
+
+\subsection{Fichier modifié}
+
+\filepath{tests/test\_jepa\_output\_formats.py}
+
+\subsection{Test du masque}
+
+Test ajouté :
+
+\begin{lstlisting}[language=Python]
+test_direct_multi_horizon_mask()
+\end{lstlisting}
+
+Il vérifie que :
+
+\begin{itemize}
+  \item les actions ne voient pas les actions futures ;
+  \item les queries ne voient pas les actions futures ;
+  \item les queries ne communiquent pas entre elles, sauf auto-attention à elles-mêmes.
+\end{itemize}
+
+\subsection{Test du nouveau \code{unroll}}
+
+Test ajouté :
+
+\begin{lstlisting}[language=Python]
+test_direct_multi_horizon_unroll_with_loss()
+\end{lstlisting}
+
+Il vérifie :
+
+\begin{itemize}
+  \item la forme de sortie en entraînement ;
+  \item la présence d'une loss finie ;
+  \item la forme de sortie en planning sans loss.
+\end{itemize}
+
+\section{Validation effectuée}
+
+Les validations suivantes ont été exécutées avec succès :
+
+\begin{lstlisting}
+python3 -m py_compile ...
+git diff --check
+\end{lstlisting}
+
+Cela garantit :
+
+\begin{itemize}
+  \item absence d'erreurs syntaxiques Python ;
+  \item absence de problèmes de whitespace dans le diff.
+\end{itemize}
+
+\subsection{Limite de validation}
+
+Les tests PyTorch complets n'ont pas pu être lancés dans l'environnement courant, car :
+
+\begin{itemize}
+  \item \code{torch} n'est pas installé dans le \code{python3} disponible ;
+  \item \code{pytest} n'est pas disponible ;
+  \item \code{uv} n'est pas disponible ;
+  \item le \code{python3} système est en version 3.9.6, alors que le projet demande Python 3.12.
+\end{itemize}
+
+\section{Limites et points à surveiller}
+
+\subsection{Historique réel en MPC}
+
+Le code supporte \code{context\_length > 1} au niveau du prédicteur et du training.
+Cependant, le planner actuel reçoit principalement l'observation courante.
+
+Si l'objectif final est vraiment :
+
+\[
+G(z_{t-c+1:t}, a_t,\dots,a_{t+K-1})
+\]
+
+alors il faudra ajouter une mémoire d'observations dans \code{GCAgent}, afin que le MPC
+fournisse les derniers états réels au modèle au lieu d'un contexte paddé.
+
+\subsection{Encodeur Impala global}
+
+L'encodeur actuel produit une représentation globale :
+
+\[
+[B, 512, T, 1, 1]
+\]
+
+Donc le mécanisme query par patch fonctionne, mais avec un seul patch. Si l'on veut se
+rapprocher davantage de V-JEPA 2, il faudra probablement utiliser un encodeur qui conserve
+une grille de tokens spatiaux.
+
+\subsection{Comparaison expérimentale à faire}
+
+Il faudra comparer :
+
+\begin{itemize}
+  \item ancien \code{RNNPredictor} autoregressif ;
+  \item nouveau prédicteur direct multi-horizon ;
+  \item \code{context\_length = 1} contre \code{context\_length > 1} ;
+  \item coût MPC terminal seul contre coût sur tous les horizons.
+\end{itemize}
+
+\section{Commandes utiles}
+
+Pour lancer l'entraînement avec le nouveau mode :
+
+\begin{lstlisting}
+python -m examples.ac_video_jepa.main \
+  --fname examples/ac_video_jepa/cfgs/train.yaml
+\end{lstlisting}
+
+Pour revenir à l'ancien prédicteur GRU :
+
+\begin{lstlisting}
+python -m examples.ac_video_jepa.main \
+  --fname examples/ac_video_jepa/cfgs/train.yaml \
+  model.predictor_type=rnn
+\end{lstlisting}
+
+Pour tester l'idée avec un contexte plus long :
+
+\begin{lstlisting}
+python -m examples.ac_video_jepa.main \
+  --fname examples/ac_video_jepa/cfgs/train.yaml \
+  model.context_length=3
+\end{lstlisting}
+
+\section{Conclusion}
+
+La modification principale est conceptuelle : le modèle n'est plus obligé de propager
+ses propres erreurs horizon après horizon. Il apprend maintenant une fonction directe :
+
+\[
+G(z_t, a_t,\dots,a_{t+4})
+\rightarrow
+(\hat z_{t+1},\dots,\hat z_{t+5})
+\]
+
+avec une causalité stricte :
+
+\[
+\hat z_{t+h}
+\not\leftarrow
+a_{t+h}, a_{t+h+1}, \dots, a_{t+4}
+\]
+
+Ce changement aligne mieux le modèle avec le MPC : le planner peut scorer directement
+une séquence candidate d'actions via l'état latent terminal prédit, puis exécuter seulement
+la première action et replanifier.
+
+\end{document}

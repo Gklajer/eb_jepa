@@ -8,7 +8,7 @@ task_specification:
 planner:
   planner_name: mppi # cem | mppi | admm
   num_act_stepped: 1
-  plan_length: 90 # horizon
+  plan_length: 5 # horizon; should match model.nsteps for direct_multi_horizon
   n_iters: 20 # number of planning iterations
   num_samples: 200 # number of samples for CEM
   num_elites: 20 # number of elites for CEM
@@ -19,8 +19,10 @@ planner:
     - 1
   var_scale: 1.5
   decode_each_iteration: false
+  action_l2_coeff: 0.01
+  action_smoothness_coeff: 0.05
   planning_objective:
     objective_type: repr_dist
-    sum_all_diffs: true
+    sum_all_diffs: false
     alpha: 0.
 ctxt_window_time: 1

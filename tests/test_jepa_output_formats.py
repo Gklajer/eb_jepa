@@ -16,6 +16,7 @@ import torch
 import torch.nn as nn
 
 from eb_jepa.architectures import (
+    CausalMultiHorizonPredictor,
     ImpalaEncoder,
     InverseDynamicsModel,
     Projector,
@@ -23,9 +24,15 @@ from eb_jepa.architectures import (
     ResUNet,
     RNNPredictor,
     StateOnlyPredictor,
+    build_multi_horizon_mask,
 )
 from eb_jepa.jepa import JEPA
-from eb_jepa.losses import SquareLossSeq, VC_IDM_Sim_Regularizer, VCLoss
+from eb_jepa.losses import (
+    MultiHorizonLoss,
+    SquareLossSeq,
+    VC_IDM_Sim_Regularizer,
+    VCLoss,
+)
 
 
 # ============================================================================
@@ -157,6 +164,14 @@ def create_ac_video_jepa_model(device="cpu", img_size=65):
     }
 
     return jepa, config
+
+
+class ZeroRegularizer(nn.Module):
+    """Regularizer stub for output-format tests."""
+
+    def forward(self, x, actions=None):
+        loss = x.sum() * 0.0
+        return loss, loss, {}
 
 
 # ============================================================================
@@ -751,6 +766,103 @@ def test_unroll_return_all_steps_format():
     return True
 
 
+def test_direct_multi_horizon_mask():
+    """Verify causal access rules for the direct multi-horizon predictor mask."""
+    num_context_tokens = 2 * 3
+    num_patches = 3
+    horizon = 4
+    mask = build_multi_horizon_mask(
+        num_context_tokens=num_context_tokens,
+        num_patches=num_patches,
+        horizon=horizon,
+        device="cpu",
+    )
+
+    action_start = num_context_tokens
+    query_start = action_start + horizon
+
+    # Action token j can attend action prefix only.
+    for j in range(horizon):
+        row = action_start + j
+        assert not mask[row, :num_context_tokens].any()
+        assert not mask[row, action_start : action_start + j + 1].any()
+        assert mask[row, action_start + j + 1 : action_start + horizon].all()
+
+    # Query h can attend context and actions a_0...a_h, but no future actions.
+    for h in range(horizon):
+        for p in range(num_patches):
+            row = query_start + h * num_patches + p
+            assert not mask[row, :num_context_tokens].any()
+            assert not mask[row, action_start : action_start + h + 1].any()
+            assert mask[row, action_start + h + 1 : action_start + horizon].all()
+
+            query_cols = mask[row, query_start:]
+            self_col = h * num_patches + p
+            assert not query_cols[self_col]
+            query_cols_without_self = torch.cat(
+                [query_cols[:self_col], query_cols[self_col + 1 :]]
+            )
+            assert query_cols_without_self.all()
+
+
+def test_direct_multi_horizon_unroll_with_loss():
+    """Test JEPA direct multi-horizon mode with sliding training windows."""
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    b, d, t, h, w = 2, 8, 7, 2, 2
+    action_dim = 2
+    horizon = 3
+    context_length = 2
+
+    predictor = CausalMultiHorizonPredictor(
+        encoder_dim=d,
+        action_dim=action_dim,
+        num_patches=h * w,
+        horizon=horizon,
+        context_length=context_length,
+        pred_dim=16,
+        depth=1,
+        num_heads=4,
+    ).to(device)
+    model = JEPA(
+        encoder=nn.Identity(),
+        aencoder=nn.Identity(),
+        predictor=predictor,
+        regularizer=ZeroRegularizer(),
+        predcost=MultiHorizonLoss(gamma=0.5),
+    ).to(device)
+
+    observations = torch.randn(b, d, t, h, w, device=device)
+    actions = torch.randn(b, action_dim, t, device=device)
+    predicted, losses = model.unroll(
+        observations,
+        actions,
+        nsteps=horizon,
+        unroll_mode="direct_multi_horizon",
+        ctxt_window_time=context_length,
+        compute_loss=True,
+        return_all_steps=False,
+    )
+
+    assert predicted.shape == (b, d, context_length + horizon, h, w)
+    assert losses is not None
+    total_loss, reg_loss, _, _, pred_loss = losses
+    assert torch.isfinite(total_loss)
+    assert torch.isfinite(reg_loss)
+    assert torch.isfinite(pred_loss)
+
+    planned, plan_losses = model.unroll(
+        observations[:, :, :1],
+        actions[:, :, :horizon],
+        nsteps=horizon,
+        unroll_mode="direct_multi_horizon",
+        ctxt_window_time=context_length,
+        compute_loss=False,
+        return_all_steps=False,
+    )
+    assert plan_losses is None
+    assert planned.shape == (b, d, context_length + horizon, h, w)
+
+
 def run_all_tests():
     """Run all tests for unroll() function."""
     print("\n" + "#" * 60)
@@ -802,6 +914,18 @@ def run_all_tests():
         results["return_all_steps format"] = "PASSED"
     except AssertionError as e:
         results["return_all_steps format"] = f"FAILED: {e}"
+
+    try:
+        test_direct_multi_horizon_mask()
+        results["direct multi-horizon mask"] = "PASSED"
+    except AssertionError as e:
+        results["direct multi-horizon mask"] = f"FAILED: {e}"
+
+    try:
+        test_direct_multi_horizon_unroll_with_loss()
+        results["direct multi-horizon unroll"] = "PASSED"
+    except AssertionError as e:
+        results["direct multi-horizon unroll"] = f"FAILED: {e}"
 
     # Summary
     print("\n" + "#" * 60)

@@ -421,12 +421,23 @@ class GCAgent:
         nsteps = actions.shape[2]
         if repeat_batch:
             obs_init = obs_init.repeat(batch_size, 1, 1, 1, 1)
+        predictor = getattr(self.model, "predictor", None)
+        if predictor is None and hasattr(self.model, "_orig_mod"):
+            predictor = getattr(self.model._orig_mod, "predictor", None)
+        use_direct = getattr(predictor, "direct_multi_horizon", False)
+        unroll_mode = "direct_multi_horizon" if use_direct else "autoregressive"
+        if use_direct:
+            ctxt_window_time = getattr(predictor, "context_length", 1)
+        elif self.plan_cfg:
+            ctxt_window_time = self.plan_cfg["ctxt_window_time"]
+        else:
+            ctxt_window_time = 1
         predicted_states, _ = self.model.unroll(
             obs_init,
             actions,
             nsteps=nsteps,
-            unroll_mode="autoregressive",
-            ctxt_window_time=self.plan_cfg["ctxt_window_time"] if self.plan_cfg else 1,
+            unroll_mode=unroll_mode,
+            ctxt_window_time=ctxt_window_time,
             compute_loss=False,
             return_all_steps=False,
         )
@@ -511,9 +522,17 @@ class PlanningResult(NamedTuple):
 
 
 class Planner(ABC):
-    def __init__(self, unroll: Callable, **kwargs):
+    def __init__(
+        self,
+        unroll: Callable,
+        action_l2_coeff: float = 0.0,
+        action_smoothness_coeff: float = 0.0,
+        **kwargs,
+    ):
         self.unroll = unroll
         self.objective = None
+        self.action_l2_coeff = action_l2_coeff
+        self.action_smoothness_coeff = action_smoothness_coeff
 
     def set_objective(self, objective: Callable):
         self.objective = objective
@@ -532,7 +551,13 @@ class Planner(ABC):
         self, actions: torch.Tensor, obs_init: torch.Tensor
     ) -> torch.Tensor:
         predicted_encs = self.unroll(obs_init, actions)
-        return self.objective(predicted_encs)
+        cost = self.objective(predicted_encs)
+        if self.action_l2_coeff:
+            cost = cost + self.action_l2_coeff * actions.pow(2).mean(dim=(1, 2))
+        if self.action_smoothness_coeff and actions.size(2) > 1:
+            smoothness = (actions[:, :, 1:] - actions[:, :, :-1]).pow(2)
+            cost = cost + self.action_smoothness_coeff * smoothness.mean(dim=(1, 2))
+        return cost
 
 
 ### Specific planning optimizers ###
@@ -552,7 +577,7 @@ class CEMPlanner(Planner):
         decode_loc_to_pixel: Optional[Callable] = None,
         **kwargs,
     ):
-        super().__init__(unroll)
+        super().__init__(unroll, **kwargs)
         self.n_iters = n_iters
         self.num_samples = num_samples
         self.plan_length = plan_length
@@ -675,7 +700,7 @@ class MPPIPlanner(Planner):
         decode_loc_to_pixel: Optional[Callable] = None,
         **kwargs,
     ):
-        super().__init__(unroll)
+        super().__init__(unroll, **kwargs)
         self.n_iters = n_iters
         self.num_samples = num_samples
         self.plan_length = plan_length

@@ -26,6 +26,58 @@ class SquareLossSeq(nn.Module):
         return square_cost_seq(state, predi)
 
 
+class MultiHorizonLoss(nn.Module):
+    """Weighted direct multi-horizon prediction loss.
+
+    Inputs are expected as [B, C, K, H, W]. The horizon dimension K is weighted
+    increasingly toward the terminal prediction by default.
+    """
+
+    def __init__(self, gamma=0.5, loss_type="smooth_l1", weights=None, proj=None):
+        super().__init__()
+        self.gamma = gamma
+        self.loss_type = loss_type
+        self.weights = weights
+        self.proj = nn.Identity() if proj is None else proj
+
+    def _weights(self, horizon, device, dtype):
+        if self.weights is not None:
+            weights = torch.as_tensor(self.weights, device=device, dtype=dtype)
+            if weights.numel() != horizon:
+                raise ValueError(
+                    f"Expected {horizon} horizon weights, got {weights.numel()}"
+                )
+            return weights / weights[-1].clamp_min(1e-12)
+        weights = torch.tensor(
+            [self.gamma ** (horizon - 1 - h) for h in range(horizon)],
+            device=device,
+            dtype=dtype,
+        )
+        return weights / weights[-1].clamp_min(1e-12)
+
+    def forward(self, state, predi):
+        b, c, k, h, w = state.shape
+        state_flat = state.permute(0, 2, 3, 4, 1).reshape(b * k * h * w, c)
+        predi_flat = predi.permute(0, 2, 3, 4, 1).reshape(b * k * h * w, c)
+        state_proj = self.proj(state_flat).view(b, k, h, w, -1)
+        predi_proj = self.proj(predi_flat).view(b, k, h, w, -1)
+
+        if self.loss_type == "smooth_l1":
+            step_loss = F.smooth_l1_loss(
+                predi_proj, state_proj.detach(), reduction="none"
+            )
+        elif self.loss_type == "l1":
+            step_loss = (predi_proj - state_proj.detach()).abs()
+        elif self.loss_type == "mse":
+            step_loss = (predi_proj - state_proj.detach()).pow(2)
+        else:
+            raise ValueError(f"Unknown loss_type: {self.loss_type}")
+
+        step_loss = step_loss.mean(dim=(-1, -2, -3))  # [B, K]
+        weights = self._weights(k, state.device, state.dtype)
+        return (step_loss * weights.unsqueeze(0)).sum(dim=1).mean()
+
+
 class VCLoss(nn.Module):
     """Variance-Covariance loss attracting means to zero and covariance to identity."""
 

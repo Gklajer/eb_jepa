@@ -454,6 +454,190 @@ class RNNPredictor(nn.Module):
         return next_state[0].unsqueeze(-1).unsqueeze(-1).unsqueeze(-1)
 
 
+def build_multi_horizon_mask(
+    num_context_tokens: int,
+    num_patches: int,
+    horizon: int,
+    device,
+):
+    """Build a causal mask for direct multi-horizon latent prediction.
+
+    Token order:
+    [context latent patch tokens] + [action tokens] + [future query patch tokens].
+
+    True means the row token cannot attend to the column token.
+    """
+    context_start = 0
+    context_end = num_context_tokens
+    action_start = context_end
+    action_end = action_start + horizon
+    query_start = action_end
+    num_query_tokens = horizon * num_patches
+    num_tokens = query_start + num_query_tokens
+
+    mask = torch.ones(num_tokens, num_tokens, dtype=torch.bool, device=device)
+
+    # Past/current latent tokens cannot absorb action or query information.
+    mask[context_start:context_end, context_start:context_end] = False
+
+    # Action token h can see the latent context and action prefix a_0...a_h.
+    for h in range(horizon):
+        row = action_start + h
+        mask[row, context_start:context_end] = False
+        mask[row, action_start : action_start + h + 1] = False
+
+    # Query q_{h,p} predicts z_{t+h+1}; it can only see actions a_0...a_h.
+    for h in range(horizon):
+        for p in range(num_patches):
+            row = query_start + h * num_patches + p
+            mask[row, context_start:context_end] = False
+            mask[row, action_start : action_start + h + 1] = False
+            mask[row, row] = False
+
+    return mask
+
+
+class CausalMultiHorizonPredictor(nn.Module):
+    """Transformer predictor that outputs multiple future latents in one pass.
+
+    The predictor is direct multi-horizon: all horizons are produced by one forward
+    pass, while the attention mask ensures horizon h only has access to the action
+    prefix needed to reach that horizon.
+    """
+
+    def __init__(
+        self,
+        encoder_dim: int = 512,
+        action_dim: int = 2,
+        num_patches: int = 1,
+        horizon: int = 5,
+        context_length: int = 1,
+        pred_dim: Optional[int] = None,
+        depth: int = 4,
+        num_heads: int = 8,
+        mlp_ratio: float = 4.0,
+        dropout: float = 0.0,
+    ):
+        super().__init__()
+        pred_dim = encoder_dim if pred_dim is None else pred_dim
+        if pred_dim % num_heads != 0:
+            raise ValueError(
+                f"pred_dim ({pred_dim}) must be divisible by num_heads ({num_heads})"
+            )
+
+        self.encoder_dim = encoder_dim
+        self.action_dim = action_dim
+        self.num_patches = num_patches
+        self.horizon = horizon
+        self.context_length = context_length
+        self.pred_dim = pred_dim
+        self.is_rnn = False
+        self.direct_multi_horizon = True
+
+        self.z_proj = nn.Linear(encoder_dim, pred_dim)
+        self.action_proj = nn.Linear(action_dim, pred_dim)
+
+        self.context_time_emb = nn.Parameter(
+            torch.randn(1, context_length, 1, pred_dim) * 0.02
+        )
+        self.patch_emb = nn.Parameter(torch.randn(1, 1, num_patches, pred_dim) * 0.02)
+        self.action_time_emb = nn.Parameter(torch.randn(1, horizon, pred_dim) * 0.02)
+        self.future_queries = nn.Parameter(
+            torch.randn(1, horizon, num_patches, pred_dim) * 0.02
+        )
+        self.future_time_emb = nn.Parameter(
+            torch.randn(1, horizon, 1, pred_dim) * 0.02
+        )
+        self.future_patch_emb = nn.Parameter(
+            torch.randn(1, 1, num_patches, pred_dim) * 0.02
+        )
+
+        encoder_layer = nn.TransformerEncoderLayer(
+            d_model=pred_dim,
+            nhead=num_heads,
+            dim_feedforward=int(pred_dim * mlp_ratio),
+            dropout=dropout,
+            activation="gelu",
+            batch_first=True,
+            norm_first=True,
+        )
+        self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=depth)
+        self.norm = nn.LayerNorm(pred_dim)
+        self.out_proj = nn.Linear(pred_dim, encoder_dim)
+
+    def forward(self, state, action):
+        """
+        Args:
+            state: [B, D, C, H, W] latent context, usually C=1 or a short past window.
+            action: [B, A, K] action sequence.
+
+        Returns:
+            pred: [B, D, K, H, W] direct predictions for the next K states.
+        """
+        if action is None:
+            raise ValueError("CausalMultiHorizonPredictor requires action inputs")
+
+        b, d, context_len, h, w = state.shape
+        _, action_dim, horizon = action.shape
+        num_patches = h * w
+        if d != self.encoder_dim:
+            raise ValueError(f"Expected state dim {self.encoder_dim}, got {d}")
+        if action_dim != self.action_dim:
+            raise ValueError(f"Expected action dim {self.action_dim}, got {action_dim}")
+        if context_len > self.context_length:
+            raise ValueError(
+                f"context_len ({context_len}) exceeds configured context_length "
+                f"({self.context_length})"
+            )
+        if horizon > self.horizon:
+            raise ValueError(
+                f"horizon ({horizon}) exceeds configured horizon ({self.horizon})"
+            )
+        if num_patches != self.num_patches:
+            raise ValueError(
+                f"Expected {self.num_patches} latent patches, got {num_patches}"
+            )
+
+        context_tokens = state.permute(0, 2, 3, 4, 1).reshape(
+            b, context_len, num_patches, d
+        )
+        context_tokens = self.z_proj(context_tokens)
+        context_tokens = (
+            context_tokens
+            + self.context_time_emb[:, -context_len:]
+            + self.patch_emb
+        )
+        context_tokens = context_tokens.reshape(b, context_len * num_patches, -1)
+
+        action_tokens = action.transpose(1, 2)
+        action_tokens = self.action_proj(action_tokens)
+        action_tokens = action_tokens + self.action_time_emb[:, :horizon]
+
+        query_tokens = (
+            self.future_queries[:, :horizon]
+            + self.future_time_emb[:, :horizon]
+            + self.future_patch_emb
+        )
+        query_tokens = query_tokens.expand(b, -1, -1, -1).reshape(
+            b, horizon * num_patches, -1
+        )
+
+        tokens = torch.cat([context_tokens, action_tokens, query_tokens], dim=1)
+        attn_mask = build_multi_horizon_mask(
+            num_context_tokens=context_len * num_patches,
+            num_patches=num_patches,
+            horizon=horizon,
+            device=tokens.device,
+        )
+        tokens = self.transformer(tokens, mask=attn_mask)
+
+        query_out = tokens[:, -(horizon * num_patches) :]
+        query_out = query_out.reshape(b, horizon, h, w, self.pred_dim)
+        pred = self.out_proj(self.norm(query_out))
+        pred = pred.permute(0, 4, 1, 2, 3).contiguous()
+        return pred
+
+
 class InverseDynamicsModel(nn.Module):
     """
     Predicts the action that caused a transition from state_t to state_t_plus_1.
