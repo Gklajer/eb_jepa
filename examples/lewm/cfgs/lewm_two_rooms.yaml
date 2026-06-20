@@ -1,0 +1,43 @@
+# LeWorldModel (arXiv:2603.19312) — TwoRoom reproduction.
+logging:
+  log_wandb: true
+  wandb_project: lewm
+  wandb_name: lewm_two_rooms
+  log_every: 10
+  tqdm_silent: false
+meta:
+  seed: 1
+data:
+  env_name: two_rooms
+  batch_size: 128
+  num_workers: 8
+  pin_mem: true
+  persistent_workers: false
+  size: 20000          # episodes per epoch (paper: 10k); online synthetic gen
+  val_size: 1000
+  pipeline:
+    mode: online
+training:
+  use_amp: true
+  dtype: bfloat16
+model:
+  in_channels: 2
+  img_size: 224        # paper: 224x224
+  patch: 14            # ViT-Tiny patch 14 -> 16x16=256 patches
+  enc_dim: 192
+  enc_depth: 12
+  enc_heads: 3
+  pred_dim: 384        # ViT-S backbone
+  pred_depth: 6
+  pred_heads: 6
+  pred_dropout: 0.1
+  num_frames: 4        # sub-trajectory length
+  frame_skip: 5        # frame-skip / action-block size
+optim:
+  epochs: 10
+  lr: 3.e-4
+  weight_decay: 1.e-4
+  warmup_ratio: 0.05
+  grad_clip: 1.0
+  sigreg_lambda: 0.1   # the single loss coefficient (λ)
+  sigreg_proj: 1024    # M random projections
