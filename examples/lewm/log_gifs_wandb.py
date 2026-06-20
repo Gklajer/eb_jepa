@@ -33,13 +33,16 @@ def parse_results(root):
 def run(root: str, project: str = "lewm", name: str = "lewm_gifs_eval"):
     wandb.init(project=project, name=name)
     results = parse_results(root)
-    gifs = sorted(glob.glob(os.path.join(root, "*", "viz", "*.gif")))
+    # catch both <run>/viz/*.gif and <run>/viz_cls/*.gif (CLS-decoded)
+    gifs = sorted(glob.glob(os.path.join(root, "*", "viz*", "*.gif")))
     table = wandb.Table(columns=["variant", "gif", "feature", "lin_r", "mlp_r",
                                  "mlp_mse", "rollout_mse", "verdict"])
     for g in gifs:
-        variant = g.split("/")[-3]  # run dir name
+        run_dir = g.split("/")[-3]   # run dir name
+        viz_dir = g.split("/")[-2]   # viz | viz_cls
+        variant = run_dir if viz_dir == "viz" else f"{run_dir}__{viz_dir}"
         wandb.log({f"rollout/{variant}": wandb.Video(g, format="gif", caption=variant)})
-        r = results.get(variant, {})
+        r = results.get(run_dir, {})
         table.add_data(variant, g, r.get("feature", "-"), r.get("lin_r", r.get("pearson", "-")),
                        r.get("mlp_r", "-"), r.get("mlp_mse", r.get("pos_mse", "-")),
                        r.get("rollout_mse", "-"), r.get("verdict", "-"))
