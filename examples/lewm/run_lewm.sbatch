@@ -22,7 +22,10 @@ RUN_DIR="${RUN_DIR:-$G/lewm_train/run1}"
 mkdir -p "$RUN_DIR"
 # Put the branch on the path so `eb_jepa.lewm` + `examples.lewm` resolve from here.
 export PYTHONPATH="$REPO"
-export WANDB_MODE=offline WANDB_DIR="$RUN_DIR" WANDB_CACHE_DIR="$G/.cache/wandb" \
+# WANDB_MODE (online/offline) and WANDB_API_KEY come from the submit environment
+# (propagated via sbatch --export=ALL); never written to this tracked file.
+export WANDB_MODE="${WANDB_MODE:-online}" \
+       WANDB_DIR="$RUN_DIR" WANDB_CACHE_DIR="$G/.cache/wandb" \
        HF_HOME="$G/.cache/huggingface" TORCH_HOME="$G/.cache/torch" \
        TRITON_CACHE_DIR="$G/.cache/triton" XDG_CACHE_HOME="$G/.cache" \
        EBJEPA_CKPTS="$G/checkpoints"
