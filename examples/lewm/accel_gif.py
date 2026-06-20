@@ -58,22 +58,36 @@ def _spec_forwards_per_step(pred, first, actions, T, threshold):
     return fwd, chunks
 
 
-def _panel(frame, title, fwd, step, T, up=4):
-    H, W = frame.shape[:2]
-    img = cv2.resize(frame, (W * up, H * up), interpolation=cv2.INTER_NEAREST)
-    pad = np.zeros((48, W * up, 3), np.uint8)
-    canvas = np.vstack([pad, img])
-    cv2.putText(canvas, title, (6, 18), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1, cv2.LINE_AA)
-    cv2.putText(canvas, f"forwards: {fwd}", (6, 38), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (90, 220, 90), 1, cv2.LINE_AA)
-    # progress bar of rollout step
-    bw = int((W * up - 12) * step / max(T - 1, 1))
-    cv2.rectangle(canvas, (6, 44), (6 + bw, 47), (90, 160, 255), -1)
+def _to_rgb(fr2):
+    """2-channel two_rooms frame [H,W,C] in [0,1] -> RGB (red agent, green wall)."""
+    H, W = fr2.shape[:2]
+    rgb = np.zeros((H, W, 3), np.float32)
+    rgb[..., 0] = fr2[..., 0]                       # agent -> red
+    if fr2.shape[-1] > 1:
+        rgb[..., 1] = fr2[..., 1]                   # wall  -> green
+    return (np.clip(rgb, 0, 1) * 255).astype(np.uint8)
+
+
+def _panel(frame_rgb, title, f, step, T, done_at=None, up=5):
+    H, W = frame_rgb.shape[:2]
+    img = cv2.resize(frame_rgb, (W * up, H * up), interpolation=cv2.INTER_NEAREST)
+    head = np.zeros((56, W * up, 3), np.uint8)
+    canvas = np.vstack([head, img])
+    cv2.putText(canvas, title, (8, 20), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 255, 255), 1, cv2.LINE_AA)
+    if done_at is not None and f >= done_at:
+        cv2.putText(canvas, f"DONE - {done_at} forwards", (8, 44),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.55, (80, 230, 80), 2, cv2.LINE_AA)
+    else:
+        cv2.putText(canvas, f"forwards: {f}", (8, 44),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (90, 200, 255), 1, cv2.LINE_AA)
+    bw = int((W * up - 16) * step / max(T - 1, 1))
+    cv2.rectangle(canvas, (8, 50), (8 + bw, 53), (90, 160, 255), -1)
     return canvas
 
 
 @torch.no_grad()
 def make(ckpt1: str, ckpt4: str, out: str = "accel.gif", horizon: int = None,
-         threshold: float = 0.1, fps: int = 4, seed: int = 0):
+         threshold: float = 0.1, fps: int = 3, seed: int = 0):
     setup_seed(seed)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     enc1, pred1, c1 = _build(ckpt1, device)
@@ -90,8 +104,7 @@ def make(ckpt1: str, ckpt4: str, out: str = "accel.gif", horizon: int = None,
     Traw = raw.shape[0]
     T = horizon or Traw
     T = min(T, Traw)
-    frames = [(np.stack([raw[t, :, :, 0]] * 3, -1) * 255).astype(np.uint8) if raw.shape[-1] < 3
-              else (raw[t] * 255).astype(np.uint8) for t in range(T)]
+    frames = [_to_rgb(raw[t]) for t in range(T)]      # red agent, green wall
 
     # forward-pass schedule
     first = enc4(x[:1, :, :1]).float()
@@ -108,15 +121,15 @@ def make(ckpt1: str, ckpt4: str, out: str = "accel.gif", horizon: int = None,
                 s = i
         return s
 
+    van_done, spec_done = van_fwd[-1], spec_fwd[-1]   # forwards to finish each
     gif = []
     for f in range(1, total_fwd + 1):
         sv = step_after(van_fwd, f); ss = step_after(spec_fwd, f)
-        left = _panel(frames[sv], "mtp=1  vanilla AR", min(f, T), sv, T)
-        right = _panel(frames[ss], f"mtp={pred4.mtp}  self-speculative", min(f, spec_fwd[-1] if False else f), ss, T)
-        sep = np.full((left.shape[0], 6, 3), 60, np.uint8)
+        left = _panel(frames[sv], "mtp=1  vanilla AR", f, sv, T, done_at=van_done)
+        right = _panel(frames[ss], f"mtp={pred4.mtp}  self-speculative", f, ss, T, done_at=spec_done)
+        sep = np.full((left.shape[0], 8, 3), 70, np.uint8)
         gif.append(np.hstack([left, sep, right]))
-    # hold last frame
-    gif += [gif[-1]] * fps
+    gif += [gif[-1]] * (fps * 2)                       # hold final frame
     imageio.mimsave(out, gif, fps=fps, loop=0)
     logger.info(f"saved {out} | vanilla {van_fwd[-1]} forwards vs speculative {spec_fwd[-1]} forwards "
                 f"for {T} steps -> {van_fwd[-1]/max(spec_fwd[-1],1):.2f}x fewer forwards")
